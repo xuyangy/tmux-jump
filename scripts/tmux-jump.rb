@@ -4,9 +4,9 @@ require 'tempfile'
 require 'open3'
 
 # SPECIAL STRINGS
-GRAY = ENV['JUMP_BACKGROUND_COLOR'].gsub('\e', "\e")
+GRAY = (ENV['JUMP_BACKGROUND_COLOR'] || '\e[48;5;240m').gsub('\e', "\e")
 # RED = "\e[38;5;124m"
-RED = ENV['JUMP_FOREGROUND_COLOR'].gsub('\e', "\e")
+RED = (ENV['JUMP_FOREGROUND_COLOR'] || '\e[38;5;124m').gsub('\e', "\e")
 CLEAR_SEQ = "\e[2J"
 HOME_SEQ = "\e[H"
 RESET_COLORS = "\e[0m"
@@ -86,7 +86,13 @@ def prompt_char! # raises Timeout::Error
   thread_0 = async_read_char_from_file! tmp_file, result_queue
   thread_1 = async_detect_user_escape result_queue
 
-  char = result_queue.pop
+   char = result_queue.pop
+
+   # Handle cancellation key (e.g., <Esc>)
+   if char.nil?
+     puts 'Jump operation canceled.'
+     Kernel.exit
+   end
 
   thread_0.kill
   thread_1.kill
@@ -122,11 +128,17 @@ def async_detect_user_escape(result_queue)
     loop do
       new_activity =
         Open3.capture2 'tmux', 'display-message', '-p', '#{session_activity}'
-      sleep 0.05
-      if last_activity != new_activity
-        # Optionally push escape signal here if wanted
-        # result_queue.push nil
-      end
+       sleep 0.05
+       if last_activity != new_activity
+         last_activity = new_activity
+       end
+
+       # Detect <Esc> key and push signal to result_queue
+       esc_key_pressed = `tmux display-message -p '#{key}'`.strip == "\e"
+       if esc_key_pressed
+         result_queue.push nil
+         break
+       end
     end
   end
 end
@@ -197,7 +209,10 @@ def prompt_position_index!(positions, screen_chars) # raises Timeout::Error
   keys = keys_for positions.size
   key_len = keys.first.size
   draw_keys_onto_tty screen_chars, positions, keys, key_len
-  key_index = KEYS.index(prompt_char!)
+   char = prompt_char!
+   return nil if char.nil? # Handle cancellation
+
+   key_index = KEYS.index(char)
 
   if !key_index.nil? && key_len > 1
     magnitude = KEYS.size ** (key_len - 1)
@@ -288,6 +303,6 @@ if $PROGRAM_NAME == __FILE__
   Config.alternate_on = tmux_data[5]
   Config.scroll_position = tmux_data[6].to_i
   Config.pane_height = tmux_data[7].to_i
-  Config.tmp_file = ARGV[0]
+  Config.tmp_file = ARGV[0] || Tempfile.new('tmux-jump').path
   main
 end
