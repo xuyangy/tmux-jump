@@ -148,12 +148,16 @@ def positions_of(jump_to_chars, screen_chars)
   positions = []
   case jump_to_chars.length
   when 1
-    target = jump_to_chars[0].downcase
+     target = jump_to_chars[0]
+     case_sensitive = target == target.upcase
+
+     # Adjust target for case-insensitive matching if needed
+     target = target.downcase unless case_sensitive
     return positions unless target =~ /\w/  # only jump to 'word' chars
     screen_chars.each_char.with_index do |char, i|
       next unless char =~ /\w/
       # mimic original semantic: start-of-word (start of buffer or previous non-word)
-      if char.downcase == target && (i == 0 || (screen_chars[i - 1] =~ /\w/).nil?)
+       if (case_sensitive ? char == target : char.downcase == target) && (i == 0 || (screen_chars[i - 1] =~ /\w/).nil?)
         positions << i
       end
     end
@@ -163,15 +167,15 @@ def positions_of(jump_to_chars, screen_chars)
     # original logic preserved / mildly hardened
     if screen_chars[0] && screen_chars[1] &&
        screen_chars[0] =~ /\w/ &&
-       screen_chars[0].downcase == a &&
-       screen_chars[1].downcase == b
+        (case_sensitive ? screen_chars[0] == a : screen_chars[0].downcase == a) &&
+        (case_sensitive ? screen_chars[1] == b : screen_chars[1].downcase == b)
       positions << 0
     end
     screen_chars.each_char.with_index do |char, i|
       # we consider the next two chars starting after a non-word boundary
       if (char =~ /\w/).nil? \
-         && screen_chars[i + 1] && screen_chars[i + 1].downcase == a \
-         && screen_chars[i + 2] && screen_chars[i + 2].downcase == b
+         && screen_chars[i + 1]           && (case_sensitive ? screen_chars[i + 1] == a : screen_chars[i + 1].downcase == a) \
+         && screen_chars[i + 2]           && (case_sensitive ? screen_chars[i + 2] == b : screen_chars[i + 2].downcase == b)
         positions << i + 1
       end
     end
