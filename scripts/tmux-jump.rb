@@ -88,8 +88,8 @@ def prompt_char! # raises Timeout::Error
 
   char = result_queue.pop
 
-  thread_0.exit
-  thread_1.exit
+  thread_0.kill
+  thread_1.kill
 
   char
 end
@@ -108,7 +108,7 @@ end
 def async_read_char_from_file!(tmp_file, result_queue)
   thread = Thread.new do
     char = read_char_from_file tmp_file
-    File.delete tmp_file
+    File.delete tmp_file.path
     result_queue.push char
   end
   thread.abort_on_exception = true
@@ -137,8 +137,9 @@ def positions_of(jump_to_chars, screen_chars)
   case jump_to_chars.length
   when 1
     target = jump_to_chars[0].downcase
+    return positions unless target =~ /\w/  # only jump to 'word' chars
     screen_chars.each_char.with_index do |char, i|
-      next unless char =~ /\w/          # only jump to 'word' chars
+      next unless char =~ /\w/
       # mimic original semantic: start-of-word (start of buffer or previous non-word)
       if char.downcase == target && (i == 0 || (screen_chars[i - 1] =~ /\w/).nil?)
         positions << i
@@ -174,7 +175,7 @@ def draw_keys_onto_tty(screen_chars, positions, keys, key_len)
     positions.each_with_index do |pos, i|
       tty << "#{GRAY}#{screen_chars[cursor..pos-1].to_s.gsub("\n", "\n\r")}"
       tty << "#{RED}#{keys[i]}"
-      cursor = pos + key_len - (KEYS_POSITION == 'off_left' ? key_len : 0)
+      cursor = [pos + key_len - (KEYS_POSITION == 'off_left' ? key_len : 0), 0].max
     end
     tty << "#{GRAY}#{screen_chars[cursor..-1].to_s.gsub("\n", "\n\r")}"
     tty << HOME_SEQ
@@ -233,7 +234,10 @@ def main
     # Did not even get the first char – abort silently.
     Kernel.exit
   ensure
-    File.delete(chars_read_file) if chars_read_file
+    if chars_read_file
+      chars_read_file.close
+      File.delete(chars_read_file.path)
+    end
   end
 
   # Cancel tmux copy-mode prompt if we were in command mode.
