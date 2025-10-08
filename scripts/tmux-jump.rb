@@ -4,7 +4,7 @@ require 'tempfile'
 require 'open3'
 
 # Read mode from arguments
-MODE = ARGV[1] || 'single'
+MODE = ARGV[0] || 'single'
 
 # SPECIAL STRINGS
 GRAY = (ENV['JUMP_BACKGROUND_COLOR'] || '\e[48;5;240m').gsub('\e', "\e")
@@ -21,9 +21,9 @@ KEYS_POSITION = ENV['JUMP_KEYS_POSITION']
 KEYS = (ENV['JUMP_KEYS'] || 'jfhgkdlsa').each_char.to_a
 SECOND_CHAR_TIMEOUT =
   begin
-    Float(ENV['JUMP_SECOND_CHAR_TIMEOUT'] || 0.35)
+    Float(ENV['JUMP_SECOND_CHAR_TIMEOUT'] || 0.01)
   rescue
-    0.35
+    0.01
   end
 # If the user pauses longer than this after the first char, we treat it as a single-char jump.
 
@@ -49,13 +49,17 @@ def recover_screen_after
 end
 
 def recover_normal_screen_after
-  File.open(Config.pane_tty_file, 'a') { |tty| tty << ENTER_ALTERNATE_SCREEN + HOME_SEQ }
+  File.open(Config.pane_tty_file, 'a') do |tty|
+    tty << ENTER_ALTERNATE_SCREEN + HOME_SEQ
+  end
   begin
     returns = yield
   rescue Timeout::Error
     # user took too long, but we recover anyways
   end
-  File.open(Config.pane_tty_file, 'a') { |tty| tty << RESTORE_NORMAL_SCREEN }
+  File.open(Config.pane_tty_file, 'a') do |tty|
+    tty << RESTORE_NORMAL_SCREEN
+  end
   returns
 end
 
@@ -63,7 +67,9 @@ def recover_alternate_screen_after
   saved_screen =
     `tmux capture-pane -ep -t #{Config.pane_nr}`[0..-2] # with colors...
       .gsub("\n", "\n\r")
-  File.open(Config.pane_tty_file, 'a') { |tty| tty << CLEAR_SEQ + HOME_SEQ }
+  File.open(Config.pane_tty_file, 'a') do |tty|
+    tty << CLEAR_SEQ + HOME_SEQ
+  end
   begin
     returns = yield
   rescue Timeout::Error
@@ -89,26 +95,26 @@ def prompt_char! # raises Timeout::Error
   thread_0 = async_read_char_from_file! tmp_file, result_queue
   thread_1 = async_detect_user_escape result_queue
 
-   char = result_queue.pop
+  char = result_queue.pop
 
-   # Handle cancellation key (e.g., <Esc>)
-   if char.nil?
-     puts 'Jump operation canceled.'
-     Kernel.exit
-   end
+  # Handle cancellation key (e.g., <Esc>)
+  if char.nil?
+    puts 'Jump operation canceled.'
+    Kernel.exit
+  end
 
-  thread_0.kill
-  thread_1.kill
+  thread_0.exit
+  thread_1.exit
 
   char
 end
 
-def read_char_from_file(tmp_file, timeout_seconds = 10) # raises Timeout::Error
+def read_char_from_file(tmp_file, timeout_seconds = 3) # raises Timeout::Error
   char = nil
   Timeout.timeout(timeout_seconds) do
-    until char
-      ready = IO.select([tmp_file], nil, nil, 0.1) # Wait for up to 0.1s for input
-      char = tmp_file.getc if ready
+    loop do
+      # busy waiting with files :/
+      break if char = tmp_file.getc
     end
   end
   char
@@ -131,17 +137,11 @@ def async_detect_user_escape(result_queue)
     loop do
       new_activity =
         Open3.capture2 'tmux', 'display-message', '-p', '#{session_activity}'
-       sleep 0.05
-       if last_activity != new_activity
-         last_activity = new_activity
-       end
-
-       # Detect <Esc> key and push signal to result_queue
-       esc_key_pressed = `tmux display-message -p '#{key}'`.strip == "\e"
-       if esc_key_pressed
-         result_queue.push nil
-         break
-       end
+      sleep 0.05
+      if last_activity != new_activity
+        # TODO: Disabled during testing
+        # result_queue.push nil
+      end
     end
   end
 end
@@ -200,14 +200,16 @@ end
 
 def draw_keys_onto_tty(screen_chars, positions, keys, key_len)
   File.open(Config.pane_tty_file, 'a') do |tty|
+    output = String.new
     cursor = 0
     positions.each_with_index do |pos, i|
-      tty << "#{GRAY}#{screen_chars[cursor..pos-1].to_s.gsub("\n", "\n\r")}"
-      tty << "#{RED}#{keys[i]}"
+      output << "#{GRAY}#{screen_chars[cursor..pos-1].to_s.gsub("\n", "\n\r")}"
+      output << "#{RED}#{keys[i]}"
       cursor = [pos + key_len - (KEYS_POSITION == 'off_left' ? key_len : 0), 0].max
     end
-    tty << "#{GRAY}#{screen_chars[cursor..-1].to_s.gsub("\n", "\n\r")}"
-    tty << HOME_SEQ
+    output << "#{GRAY}#{screen_chars[cursor..-1].to_s.gsub("\n", "\n\r")}"
+    output << HOME_SEQ
+    tty << output
   end
 end
 
@@ -256,35 +258,24 @@ end
 
 def main
   jump_to_chars = ''
-  chars_read_file = nil
-  begin
-    chars_read_file = File.new(Config.tmp_file)
-    first_char = read_char_from_file(chars_read_file) # up to 10s
-    jump_to_chars << first_char
+  `tmux send-keys -X -t #{Config.pane_nr} cancel` if Config.pane_mode == '1'
+  start = -Config.scroll_position
+  ending = -Config.scroll_position + Config.pane_height - 1
+  screen_chars =
+    `tmux capture-pane -p -t #{Config.pane_nr} -S #{start} -E #{ending}`[0..-2].gsub("︎", '') # without colors
 
-      if MODE == 'double'
-        # Attempt to read a second char quickly; if user doesn't type one, proceed with single-char jump.
-        second_char = read_optional_second_char(chars_read_file)
-        jump_to_chars << second_char if second_char
-      end
-  rescue Timeout::Error
-    # Did not even get the first char – abort silently.
-    Kernel.exit
-  ensure
-    if chars_read_file
-      chars_read_file.close
-      File.delete(chars_read_file.path)
-    end
+  # puts "screen_chars: #{screen_chars}; #{screen_chars.size} chars"
+
+  first_char = prompt_char!
+  jump_to_chars << first_char
+
+  if MODE == 'double'
+    second_char = prompt_char!
+    jump_to_chars << second_char
   end
 
   # Cancel tmux copy-mode prompt if we were in command mode.
   `tmux send-keys -X -t #{Config.pane_nr} cancel` if Config.pane_mode == '1'
-
-  start = -Config.scroll_position
-  ending = -Config.scroll_position + Config.pane_height - 1
-  screen_chars =
-    `tmux capture-pane -p -t #{Config.pane_nr} -S #{start} -E #{ending}`[0..-2]
-      .gsub("︎", '') # remove weird artifacts
 
   positions = positions_of jump_to_chars, screen_chars
   position_index = recover_screen_after do
@@ -325,6 +316,6 @@ if $PROGRAM_NAME == __FILE__
   Config.alternate_on = tmux_data[5]
   Config.scroll_position = tmux_data[6].to_i
   Config.pane_height = tmux_data[7].to_i
-  Config.tmp_file = ARGV[0] || Tempfile.new('tmux-jump').path
+  # Config.tmp_file = ARGV[0] || Tempfile.new('tmux-jump').path
   main
 end
