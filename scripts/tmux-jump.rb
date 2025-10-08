@@ -3,6 +3,9 @@ require 'timeout'
 require 'tempfile'
 require 'open3'
 
+# Read mode from arguments
+MODE = ARGV[1] || 'single'
+
 # SPECIAL STRINGS
 GRAY = (ENV['JUMP_BACKGROUND_COLOR'] || '\e[48;5;240m').gsub('\e', "\e")
 # RED = "\e[38;5;124m"
@@ -244,9 +247,11 @@ end
 
 def read_optional_second_char(file)
   # Try to read a second char within a shorter timeout; if not, return nil.
-  read_char_from_file(file, SECOND_CHAR_TIMEOUT)
-rescue Timeout::Error
-  nil
+  if IO.select([file], nil, nil, SECOND_CHAR_TIMEOUT)
+    file.getc
+  else
+    nil
+  end
 end
 
 def main
@@ -256,9 +261,12 @@ def main
     chars_read_file = File.new(Config.tmp_file)
     first_char = read_char_from_file(chars_read_file) # up to 10s
     jump_to_chars << first_char
-    # Attempt to read a second char quickly; if user doesn't type one, proceed with single-char jump.
-    second_char = read_optional_second_char(chars_read_file)
-    jump_to_chars << second_char if second_char
+
+      if MODE == 'double'
+        # Attempt to read a second char quickly; if user doesn't type one, proceed with single-char jump.
+        second_char = read_optional_second_char(chars_read_file)
+        jump_to_chars << second_char if second_char
+      end
   rescue Timeout::Error
     # Did not even get the first char – abort silently.
     Kernel.exit
