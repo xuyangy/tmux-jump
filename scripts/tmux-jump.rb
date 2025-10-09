@@ -52,13 +52,15 @@ def recover_normal_screen_after
   File.open(Config.pane_tty_file, 'a') do |tty|
     tty << ENTER_ALTERNATE_SCREEN + HOME_SEQ
   end
+  returns = nil
   begin
     returns = yield
-  rescue Timeout::Error
-    # user took too long, but we recover anyways
-  end
-  File.open(Config.pane_tty_file, 'a') do |tty|
-    tty << RESTORE_NORMAL_SCREEN
+  rescue Timeout::Error, Interrupt
+    # user took too long, or pressed Ctrl-C, but we recover anyways
+  ensure
+    File.open(Config.pane_tty_file, 'a') do |tty|
+      tty << RESTORE_NORMAL_SCREEN
+    end
   end
   returns
 end
@@ -70,16 +72,18 @@ def recover_alternate_screen_after
   File.open(Config.pane_tty_file, 'a') do |tty|
     tty << CLEAR_SEQ + HOME_SEQ
   end
+  returns = nil
   begin
     returns = yield
-  rescue Timeout::Error
-    # user took too long, but we recover anyways
-  end
-  File.open(Config.pane_tty_file, 'a') do |tty|
-    tty << RESET_COLORS + CLEAR_SEQ
-    tty << saved_screen
-    tty << "\e[#{Config.cursor_y.to_i + 1};#{Config.cursor_x.to_i + 1}H"
-    tty << RESET_COLORS
+  rescue Timeout::Error, Interrupt
+    # user took too long, or pressed Ctrl-C, but we recover anyways
+  ensure
+    File.open(Config.pane_tty_file, 'a') do |tty|
+      tty << RESET_COLORS + CLEAR_SEQ
+      tty << saved_screen
+      tty << "\e[#{Config.cursor_y.to_i + 1};#{Config.cursor_x.to_i + 1}H"
+      tty << RESET_COLORS
+    end
   end
   returns
 end
@@ -95,7 +99,14 @@ def prompt_char! # raises Timeout::Error
   thread_0 = async_read_char_from_file! tmp_file, result_queue
   thread_1 = async_detect_user_escape result_queue
 
-  char = result_queue.pop
+  char = nil
+  begin
+    char = result_queue.pop
+  rescue Interrupt
+    thread_0.kill
+    thread_1.kill
+    raise
+  end
 
   # Handle cancellation key (e.g., <Esc>)
   if char.nil?
@@ -103,8 +114,8 @@ def prompt_char! # raises Timeout::Error
     Kernel.exit
   end
 
-  thread_0.exit
-  thread_1.exit
+  thread_0.kill
+  thread_1.kill
 
   char
 end
@@ -115,6 +126,7 @@ def read_char_from_file(tmp_file, timeout_seconds = 3) # raises Timeout::Error
     loop do
       # busy waiting with files :/
       break if char = tmp_file.getc
+      sleep 0.01
     end
   end
   char
@@ -122,9 +134,14 @@ end
 
 def async_read_char_from_file!(tmp_file, result_queue)
   thread = Thread.new do
-    char = read_char_from_file tmp_file
-    File.delete tmp_file.path
-    result_queue.push char
+    begin
+      char = read_char_from_file tmp_file
+      result_queue.push char
+    rescue Timeout::Error
+      result_queue.push nil
+    ensure
+      tmp_file.close!
+    end
   end
   thread.abort_on_exception = true
   thread
@@ -140,7 +157,7 @@ def async_detect_user_escape(result_queue)
       sleep 0.05
       if last_activity != new_activity
         # TODO: Disabled during testing
-        # result_queue.push nil
+        result_queue.push nil
       end
     end
   end
