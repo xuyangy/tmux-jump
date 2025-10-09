@@ -110,7 +110,6 @@ def prompt_char! # raises Timeout::Error
 
   # Handle cancellation key (e.g., <Esc>)
   if char.nil?
-    puts 'Jump operation canceled.'
     Kernel.exit
   end
 
