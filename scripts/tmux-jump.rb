@@ -90,14 +90,14 @@ end
 
 def prompt_char! # raises Timeout::Error
   tmp_file = Tempfile.new 'tmux-jump'
-  Kernel.spawn(
+  pid = Kernel.spawn(
     'tmux', 'command-prompt', '-1', '-p', 'char:',
     "run-shell \"printf '%1' >> #{tmp_file.path}\""
   )
 
   result_queue = Queue.new
   thread_0 = async_read_char_from_file! tmp_file, result_queue
-  thread_1 = async_detect_user_escape result_queue
+  thread_1 = async_detect_prompt_exit pid, tmp_file, result_queue
 
   char = nil
   begin
@@ -147,18 +147,16 @@ def async_read_char_from_file!(tmp_file, result_queue)
   thread
 end
 
-def async_detect_user_escape(result_queue)
+def async_detect_prompt_exit(pid, tmp_file, result_queue)
   Thread.new do
-    last_activity =
-      Open3.capture2 'tmux', 'display-message', '-p', '#{session_activity}'
-    loop do
-      new_activity =
-        Open3.capture2 'tmux', 'display-message', '-p', '#{session_activity}'
-      sleep 0.05
-      if last_activity != new_activity
-        # TODO: Disabled during testing
-        result_queue.push nil
-      end
+    Process.wait(pid)
+    # The prompt process has finished.
+    # Give a tiny bit of time for the filesystem to catch up, just in case.
+    sleep 0.01
+    # If the other thread hasn't already found a character (file is empty),
+    # it means the prompt was cancelled.
+    if tmp_file.size == 0
+      result_queue.push nil
     end
   end
 end
