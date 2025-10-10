@@ -79,13 +79,10 @@ set -g @jump-keys-position 'off_left'
 You can also configure the jump mode. For single and double-key jumps, you can set the mode to 'word' or 'char'.
 ```
 # For single-key jumps (default: 'word')
-set -g @jump-mode-single 'word'
+set -g @jump-mode-single 'char'
 
-# For double-key jumps (default: 'word')
-set -g @jump-mode-double 'char'
-
-# Fallback for both modes (default: 'word')
-set -g @jump-mode 'char'
+# For double-key jumps (default: 'char')
+set -g @jump-mode-double 'word'
 ```
 
 ## Similar Projects
