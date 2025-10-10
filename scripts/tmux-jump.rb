@@ -160,8 +160,7 @@ def async_detect_prompt_exit(pid, tmp_file, result_queue)
   end
 end
 
-def positions_of(jump_to_chars, screen_chars)
-  jump_mode = ENV['JUMP_MODE'] || 'word'
+def positions_of(jump_to_chars, screen_chars, jump_mode)
   if jump_mode == 'char'
     positions_of_char(jump_to_chars, screen_chars)
   else
@@ -344,7 +343,13 @@ def main
   # Cancel tmux copy-mode prompt if we were in command mode.
   `tmux send-keys -X -t #{Config.pane_nr} cancel` if Config.pane_mode == '1'
 
-  positions = positions_of jump_to_chars, screen_chars
+  jump_mode = if MODE == 'double'
+                ENV['JUMP_MODE_DOUBLE'] || 'word'
+              else
+                ENV['JUMP_MODE_SINGLE'] || 'word'
+              end
+
+  positions = positions_of jump_to_chars, screen_chars, jump_mode
   position_index = recover_screen_after do
     prompt_position_index! positions, screen_chars
   end
