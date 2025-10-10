@@ -7,9 +7,6 @@ require 'open3'
 MODE = ARGV[0] || 'single'
 
 # SPECIAL STRINGS
-GRAY = (ENV['JUMP_BACKGROUND_COLOR'] || '\e[48;5;240m').gsub('\e', "\e")
-# RED = "\e[38;5;124m"
-RED = (ENV['JUMP_FOREGROUND_COLOR'] || '\e[38;5;124m').gsub('\e', "\e")
 CLEAR_SEQ = "\e[2J"
 HOME_SEQ = "\e[H"
 RESET_COLORS = "\e[0m"
@@ -17,7 +14,6 @@ ENTER_ALTERNATE_SCREEN = "\e[?1049h"
 RESTORE_NORMAL_SCREEN = "\e[?1049l"
 
 # CONFIG
-KEYS_POSITION = ENV['JUMP_KEYS_POSITION']
 KEYS = (ENV['JUMP_KEYS'] || 'jfhgkdlsa').each_char.to_a
 SECOND_CHAR_TIMEOUT =
   begin
@@ -36,7 +32,11 @@ Config = Struct.new(
   :alternate_on,
   :scroll_position,
   :pane_height,
-  :tmp_file
+  :tmp_file,
+  # Added for performance
+  :gray,
+  :red,
+  :keys_position
 ).new
 
 # METHODS
@@ -217,11 +217,11 @@ def draw_keys_onto_tty(screen_chars, positions, keys, key_len)
     output = String.new
     cursor = 0
     positions.each_with_index do |pos, i|
-      output << "#{GRAY}#{screen_chars[cursor..pos-1].to_s.gsub("\n", "\n\r")}"
-      output << "#{RED}#{keys[i]}"
-      cursor = [pos + key_len - (KEYS_POSITION == 'off_left' ? key_len : 0), 0].max
+      output << "#{Config.gray}#{screen_chars[cursor..pos-1].to_s.gsub("\n", "\n\r")}"
+      output << "#{Config.red}#{keys[i]}"
+      cursor = [pos + key_len - (Config.keys_position == 'off_left' ? key_len : 0), 0].max
     end
-    output << "#{GRAY}#{screen_chars[cursor..-1].to_s.gsub("\n", "\n\r")}"
+    output << "#{Config.gray}#{screen_chars[cursor..-1].to_s.gsub("\n", "\n\r")}"
     output << HOME_SEQ
     tty << output
   end
@@ -299,19 +299,17 @@ def main
   Kernel.exit 0 if position_index.nil?
   jump_to = positions[position_index]
 
+  # --- OPTIMIZED AND CORRECTED JUMP SEQUENCE ---
   # Enter copy-mode if not already
   `tmux copy-mode -t #{Config.pane_nr}`
 
-  # Tmux quirks handling (original logic)
-  `tmux send-keys -X -t #{Config.pane_nr} start-of-line`
+  # Go to top of history and start of line
   `tmux send-keys -X -t #{Config.pane_nr} top-line`
-  `tmux send-keys -X -t #{Config.pane_nr} -N 200 cursor-right`
   `tmux send-keys -X -t #{Config.pane_nr} start-of-line`
-  `tmux send-keys -X -t #{Config.pane_nr} top-line`
 
-  # Adjust for scroll offset
+  # Adjust for scroll offset by moving DOWN from the top of history
   if Config.scroll_position > 0
-    `tmux send-keys -X -t #{Config.pane_nr} -N #{Config.scroll_position} cursor-up`
+    `tmux send-keys -X -t #{Config.pane_nr} -N #{Config.scroll_position} cursor-down`
   end
 
   # Move cursor to target
@@ -319,10 +317,12 @@ def main
 end
 
 if $PROGRAM_NAME == __FILE__
-  Config.pane_nr = `tmux display-message -p "\#{pane_id}"`.strip
+  # Get pane data with a single tmux call for performance
   format = '#{pane_id};#{pane_tty};#{pane_in_mode};#{cursor_y};#{cursor_x};'\
            '#{alternate_on};#{scroll_position};#{pane_height}'
-  tmux_data = `tmux display-message -p -t #{Config.pane_nr} -F "#{format}"`.strip.split(';')
+  tmux_data = `tmux display-message -p -F "#{format}"`.strip.split(';')
+
+  Config.pane_nr = tmux_data[0]
   Config.pane_tty_file = tmux_data[1]
   Config.pane_mode = tmux_data[2]
   Config.cursor_y = tmux_data[3]
@@ -330,6 +330,11 @@ if $PROGRAM_NAME == __FILE__
   Config.alternate_on = tmux_data[5]
   Config.scroll_position = tmux_data[6].to_i
   Config.pane_height = tmux_data[7].to_i
-  # Config.tmp_file = ARGV[0] || Tempfile.new('tmux-jump').path
+
+  # Read color and position config from ENV variables (set by the shell script)
+  Config.gray = (ENV['JUMP_BACKGROUND_COLOR'] || '\e[0m\e[32m').gsub('\e', "\e")
+  Config.red = (ENV['JUMP_FOREGROUND_COLOR'] || '\e[1m\e[31m').gsub('\e', "\e")
+  Config.keys_position = ENV['JUMP_KEYS_POSITION'] || 'left'
+
   main
 end
