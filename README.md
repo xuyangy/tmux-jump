@@ -76,6 +76,12 @@ set -g @jump-keys-position 'left'
 set -g @jump-keys-position 'off_left'
 ```
 
+You can also configure the jump mode:
+```
+# Jumps to any character on the screen (default: 'word')
+set -g @jump-mode 'char'
+```
+
 ## Similar Projects
 
 * [vimium](https://vimium.github.io/)

@@ -160,8 +160,59 @@ def async_detect_prompt_exit(pid, tmp_file, result_queue)
   end
 end
 
-# Extended: supports 1-char or 2-char sequences.
 def positions_of(jump_to_chars, screen_chars)
+  jump_mode = ENV['JUMP_MODE'] || 'word'
+  if jump_mode == 'char'
+    positions_of_char(jump_to_chars, screen_chars)
+  else
+    positions_of_word(jump_to_chars, screen_chars)
+  end
+end
+
+private
+
+def positions_of_char(jump_to_chars, screen_chars)
+  positions = []
+  case jump_to_chars.length
+  when 1
+    target = jump_to_chars[0]
+    case_sensitive = (target == target.upcase)
+
+    # Adjust target for case-insensitive matching if needed
+    search_target = case_sensitive ? target : target.downcase
+
+    screen_chars.each_char.with_index do |char, i|
+      char_to_compare = case_sensitive ? char : char.downcase
+      if char_to_compare == search_target
+        positions << i
+      end
+    end
+  when 2
+    a = jump_to_chars[0]
+    b = jump_to_chars[1]
+    # Determine case sensitivity based on first character
+    case_sensitive = a == a.upcase
+
+    # Adjust for case-insensitive matching if needed
+    a = a.downcase unless case_sensitive
+    b = b.downcase unless case_sensitive
+
+    (0..screen_chars.length - 2).each do |i|
+      char_a = screen_chars[i]
+      char_b = screen_chars[i+1]
+      char_to_compare_a = case_sensitive ? char_a : char_a.downcase
+      char_to_compare_b = case_sensitive ? char_b : char_b.downcase
+      if char_to_compare_a == a && char_to_compare_b == b
+        positions << i
+      end
+    end
+  else
+    # Fallback (should not happen): treat as no matches
+  end
+  positions
+end
+
+def positions_of_word(jump_to_chars, screen_chars)
   positions = []
   case jump_to_chars.length
   when 1
@@ -211,6 +262,8 @@ def positions_of(jump_to_chars, screen_chars)
   end
   positions
 end
+
+# Extended: supports 1-char or 2-char sequences.
 
 def draw_keys_onto_tty(screen_chars, positions, keys, key_len)
   File.open(Config.pane_tty_file, 'a') do |tty|
