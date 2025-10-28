@@ -265,6 +265,14 @@ end
 # Extended: supports 1-char or 2-char sequences.
 
 def draw_keys_onto_tty(screen_chars, positions, keys, key_len)
+  if Config.alternate_on == '1'
+    draw_keys_with_cursor screen_chars, positions, keys, key_len
+  else
+    draw_keys_with_buffer screen_chars, positions, keys, key_len
+  end
+end
+
+def draw_keys_with_buffer(screen_chars, positions, keys, key_len)
   File.open(Config.pane_tty_file, 'a') do |tty|
     output = String.new
     cursor = 0
@@ -276,6 +284,62 @@ def draw_keys_onto_tty(screen_chars, positions, keys, key_len)
     output << "#{Config.gray}#{screen_chars[cursor..-1].to_s.gsub("\n", "\n\r")}"
     output << HOME_SEQ
     tty << output
+  end
+end
+
+def draw_keys_with_cursor(screen_chars, positions, keys, key_len)
+  File.open(Config.pane_tty_file, 'a') do |tty|
+    line = 0
+    column = 0
+    index = 0
+    target = positions[index]
+
+    screen_chars.each_char.with_index do |char, idx|
+      break if target.nil?
+
+      while target == idx
+        draw_column =
+          if Config.keys_position == 'off_left'
+            [column - key_len, 0].max
+          else
+            column
+          end
+
+        tty << "\e[#{line + 1};#{draw_column + 1}H"
+        tty << Config.red
+        tty << keys[index]
+        tty << RESET_COLORS
+
+        index += 1
+        target = positions[index]
+      end
+
+      if char == "\n"
+        line += 1
+        column = 0
+      else
+        column += 1
+      end
+    end
+
+    while target
+      draw_column =
+        if Config.keys_position == 'off_left'
+          [column - key_len, 0].max
+        else
+          column
+        end
+
+      tty << "\e[#{line + 1};#{draw_column + 1}H"
+      tty << Config.red
+      tty << keys[index]
+      tty << RESET_COLORS
+
+      index += 1
+      target = positions[index]
+    end
+
+    tty << HOME_SEQ
   end
 end
 
