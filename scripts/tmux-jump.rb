@@ -70,7 +70,7 @@ def recover_alternate_screen_after
     `tmux capture-pane -ep -t #{Config.pane_nr}`[0..-2] # with colors...
       .gsub("\n", "\n\r")
   File.open(Config.pane_tty_file, 'a') do |tty|
-    tty << CLEAR_SEQ + HOME_SEQ
+    tty << HOME_SEQ
   end
   returns = nil
   begin
@@ -79,7 +79,7 @@ def recover_alternate_screen_after
     # user took too long, or pressed Ctrl-C, but we recover anyways
   ensure
     File.open(Config.pane_tty_file, 'a') do |tty|
-      tty << RESET_COLORS + CLEAR_SEQ
+      tty << HOME_SEQ
       tty << saved_screen
       tty << "\e[#{Config.cursor_y.to_i + 1};#{Config.cursor_x.to_i + 1}H"
       tty << RESET_COLORS
