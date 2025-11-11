@@ -2,11 +2,12 @@
 require 'timeout'
 require 'tempfile'
 
-# Args: possible tmp_file then mode (for back-compat we detect file path)
-ARG_TMP = ARGV[0]
-ARG_MODE = ARGV[1]
-MODE = (ARG_MODE || ARG_TMP || 'single')
-EXTERNAL_TMP_FILE = (ARG_MODE ? ARG_TMP : nil)
+# Args: mode then optional pre-read chars (from tmux command-prompt)
+# Supports either a single combined string (e.g., "%1%2") or two separate args (%1 %2)
+MODE = (ARGV[0] || 'single')
+ARG_FIRST = ARGV[1]
+ARG_SECOND = ARGV[2]
+PRECHARS = ARGV[1] # backward compatibility when both chars are concatenated in one arg
 
 # SPECIAL STRINGS
 HOME_SEQ = "\e[H"
@@ -82,20 +83,7 @@ def recover_alternate_screen_after
   returns
 end
 
-def prompt_char!(external: nil) # raises Timeout::Error
-  # If external prompt file provided (shell already did tmux command-prompt), reuse it
-  # only when explicitly requested. Otherwise spawn our own prompt.
-  use_external = external.nil? ? false : external
-  if use_external && EXTERNAL_TMP_FILE
-    $external_reader ||= File.new(EXTERNAL_TMP_FILE, 'r')
-    begin
-      char = read_char_from_file $external_reader
-      return char
-    rescue Timeout::Error
-      return nil
-    end
-  end
-
+def prompt_char! # raises Timeout::Error
   tmp_file = Tempfile.new 'tmux-jump'
   pid = Kernel.spawn(
     'tmux', 'command-prompt', '-1', '-p', 'char:',
@@ -112,13 +100,16 @@ def prompt_char!(external: nil) # raises Timeout::Error
   rescue Interrupt
     thread_0.kill
     thread_1.kill
-    raise
+    # try to cancel any active tmux prompt so it doesn't linger
+    begin
+      `tmux send-keys Escape`
+    rescue StandardError
+    end
+    return nil
   end
 
   # Handle cancellation key (e.g., <Esc>)
-  if char.nil?
-    Kernel.exit
-  end
+  return nil if char.nil? || char == "\e"
 
   thread_0.kill
   thread_1.kill
@@ -128,12 +119,16 @@ end
 
 def read_char_from_file(tmp_file, timeout_seconds = 10) # raises Timeout::Error
   char = nil
-  Timeout.timeout(timeout_seconds) do
-    loop do
-      # busy waiting with files :/
-      break if char = tmp_file.getc
-      sleep 0.01
+  begin
+    Timeout.timeout(timeout_seconds) do
+      loop do
+        # busy waiting with files :/
+        break if char = tmp_file.getc
+        sleep 0.01
+      end
     end
+  rescue Interrupt
+    return nil
   end
   char
 end
@@ -143,7 +138,7 @@ def async_read_char_from_file!(tmp_file, result_queue)
     begin
       char = read_char_from_file tmp_file
       result_queue.push char
-    rescue Timeout::Error
+    rescue Timeout::Error, Interrupt
       result_queue.push nil
     ensure
       tmp_file.close!
@@ -365,7 +360,7 @@ def prompt_position_index!(positions, screen_chars) # raises Timeout::Error
   keys = keys_for positions.size
   key_len = keys.first.size
   draw_keys_onto_tty screen_chars, positions, keys, key_len
-   char = prompt_char!(external: false)
+   char = prompt_char!
    return nil if char.nil? # Handle cancellation
 
    key_index = KEYS.index(char)
@@ -396,12 +391,12 @@ def main
     `tmux capture-pane -p -t #{Config.pane_nr} -S #{start} -E #{ending}`[0..-2].gsub("︎", '') # without colors
 
   # Read the first character (prompt already running in tmux via shell script)
-  first_char = prompt_char!(external: true)
+  first_char = ARG_FIRST || (PRECHARS && PRECHARS[0]) || prompt_char!
   Kernel.exit 0 if first_char.nil?
   jump_to_chars << first_char
 
   if MODE == 'double'
-    second_char = prompt_char!(external: true)
+    second_char = ARG_SECOND || (PRECHARS && PRECHARS[1]) || prompt_char!
     Kernel.exit 0 if second_char.nil?
     jump_to_chars << second_char
   end
@@ -409,11 +404,19 @@ def main
   # Cancel tmux copy-mode prompt if we were in command mode.
   `tmux send-keys -X -t #{Config.pane_nr} cancel` if Config.pane_mode == '1'
 
-  jump_mode = if MODE == 'double'
-                ENV['JUMP_MODE_DOUBLE'] || 'word'
-              else
-                ENV['JUMP_MODE_SINGLE'] || 'word'
-              end
+  # Resolve jump mode from tmux options with env fallbacks
+  if MODE == 'double'
+    jm = `tmux show-option -gqv '@jump-mode-double'`.strip
+    jump_mode = (jm.empty? ? (ENV['JUMP_MODE_DOUBLE'] || 'char') : jm)
+  else
+    jm = `tmux show-option -gqv '@jump-mode-single'`.strip
+    jump_mode = (jm.empty? ? (ENV['JUMP_MODE_SINGLE'] || 'word') : jm)
+  end
+
+  # If punctuation or any non-word chars are used, force 'char' mode
+  if jump_mode == 'word' && jump_to_chars.chars.any? { |c| (c =~ /\w/).nil? }
+    jump_mode = 'char'
+  end
 
   positions = positions_of jump_to_chars, screen_chars, jump_mode
   position_index = recover_screen_after do
@@ -455,10 +458,13 @@ if $PROGRAM_NAME == __FILE__
   Config.scroll_position = tmux_data[6].to_i
   Config.pane_height = tmux_data[7].to_i
 
-  # Read color and position config from ENV variables (set by the shell script)
-  Config.gray = (ENV['JUMP_BACKGROUND_COLOR'] || '\e[0m\e[32m').gsub('\e', "\e")
-  Config.red = (ENV['JUMP_FOREGROUND_COLOR'] || '\e[1m\e[31m').gsub('\e', "\e")
-  Config.keys_position = ENV['JUMP_KEYS_POSITION'] || 'left'
+  # Read color and position config from tmux options so chaining via run-shell preserves settings
+  bg_opt = `tmux show-option -gqv '@jump-bg-color'`.strip
+  fg_opt = `tmux show-option -gqv '@jump-fg-color'`.strip
+  pos_opt = `tmux show-option -gqv '@jump-keys-position'`.strip
+  Config.gray = (bg_opt.empty? ? (ENV['JUMP_BACKGROUND_COLOR'] || "\e[48;5;240m") : bg_opt).gsub('\\e', "\e")
+  Config.red  = (fg_opt.empty? ? (ENV['JUMP_FOREGROUND_COLOR'] || "\e[1m\e[31m") : fg_opt).gsub('\\e', "\e")
+  Config.keys_position = pos_opt.empty? ? (ENV['JUMP_KEYS_POSITION'] || 'left') : pos_opt
 
   main
 end
