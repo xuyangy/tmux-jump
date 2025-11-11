@@ -177,38 +177,36 @@ def positions_of_char(jump_to_chars, screen_chars)
   case jump_to_chars.length
   when 1
     target = jump_to_chars[0]
-    case_sensitive = (target == target.upcase)
-
-    # Adjust target for case-insensitive matching if needed
-    search_target = case_sensitive ? target : target.downcase
-
-    screen_chars.each_char.with_index do |char, i|
-      char_to_compare = case_sensitive ? char : char.downcase
-      if char_to_compare == search_target
-        positions << i
+    if target == target.upcase
+      idx = -1
+      while idx = screen_chars.index(target, idx + 1)
+        positions << idx
+      end
+    else
+      hay = screen_chars.downcase
+      tci = target.downcase
+      idx = -1
+      while idx = hay.index(tci, idx + 1)
+        positions << idx
       end
     end
   when 2
     a = jump_to_chars[0]
     b = jump_to_chars[1]
-    # Determine case sensitivity based on first character
-    case_sensitive = a == a.upcase
-
-    # Adjust for case-insensitive matching if needed
-    a = a.downcase unless case_sensitive
-    b = b.downcase unless case_sensitive
-
-    (0..screen_chars.length - 2).each do |i|
-      char_a = screen_chars[i]
-      char_b = screen_chars[i+1]
-      char_to_compare_a = case_sensitive ? char_a : char_a.downcase
-      char_to_compare_b = case_sensitive ? char_b : char_b.downcase
-      if char_to_compare_a == a && char_to_compare_b == b
-        positions << i
+    if a == a.upcase
+      needle = a + b
+      idx = -1
+      while idx = screen_chars.index(needle, idx + 1)
+        positions << idx
+      end
+    else
+      hay = screen_chars.downcase
+      needle = (a + b).downcase
+      idx = -1
+      while idx = hay.index(needle, idx + 1)
+        positions << idx
       end
     end
-  else
-    # Fallback (should not happen): treat as no matches
   end
   positions
 end
@@ -217,49 +215,32 @@ def positions_of_word(jump_to_chars, screen_chars)
   positions = []
   case jump_to_chars.length
   when 1
-     target = jump_to_chars[0]
-     case_sensitive = target == target.upcase
-
-     # Adjust target for case-insensitive matching if needed
-     target = target.downcase unless case_sensitive
-    return positions unless target =~ /\w/  # only jump to 'word' chars
-    screen_chars.each_char.with_index do |char, i|
-      next unless char =~ /\w/
-      # mimic original semantic: start-of-word (start of buffer or previous non-word)
-       if (case_sensitive ? char == target : char.downcase == target) && (i == 0 || (screen_chars[i - 1] =~ /\w/).nil?)
-        positions << i
-      end
+    target = jump_to_chars[0]
+    return positions unless target =~ /\w/
+    regex = if target == target.upcase
+      /\b#{Regexp.escape(target)}/
+    else
+      /\b#{Regexp.escape(target)}/i
+    end
+    start_at = 0
+    while (m = regex.match(screen_chars, start_at))
+      positions << m.begin(0)
+      start_at = m.begin(0) + 1
     end
   when 2
     a = jump_to_chars[0]
     b = jump_to_chars[1]
-    # Determine case sensitivity based on first character
-    case_sensitive = a == a.upcase
-
-    # Adjust for case-insensitive matching if needed
-    a = a.downcase unless case_sensitive
-    b = b.downcase unless case_sensitive
-
-    # Check if first two chars match at position 0
-    if screen_chars[0] && screen_chars[1] &&
-       screen_chars[0] =~ /\w/ &&
-       (case_sensitive ? screen_chars[0] == a : screen_chars[0].downcase == a) &&
-       (case_sensitive ? screen_chars[1] == b : screen_chars[1].downcase == b)
-      positions << 0
+    needle = Regexp.escape(a + b)
+    regex = if a == a.upcase
+      /\b#{needle}/
+    else
+      /\b#{needle}/i
     end
-
-    screen_chars.each_char.with_index do |char, i|
-      # we consider the next two chars starting after a non-word boundary
-      if (char =~ /\w/).nil? \
-         && screen_chars[i + 1] && screen_chars[i + 1] =~ /\w/ \
-         && screen_chars[i + 2] \
-         && (case_sensitive ? screen_chars[i + 1] == a : screen_chars[i + 1].downcase == a) \
-         && (case_sensitive ? screen_chars[i + 2] == b : screen_chars[i + 2].downcase == b)
-        positions << i + 1
-      end
+    start_at = 0
+    while (m = regex.match(screen_chars, start_at))
+      positions << m.begin(0)
+      start_at = m.begin(0) + 1
     end
-  else
-    # Fallback (should not happen): treat as no matches
   end
   positions
 end
@@ -268,29 +249,22 @@ end
 
 def draw_keys_onto_tty(screen_chars, positions, keys, key_len)
   if Config.alternate_on == '1'
+    # Existing pane already has content; overlay markers only.
     draw_keys_with_cursor screen_chars, positions, keys, key_len
   else
-    draw_keys_with_buffer screen_chars, positions, keys, key_len
+    # We entered a fresh alternate screen; need to paint base text then overlay markers.
+    draw_keys_with_overlay screen_chars, positions, keys, key_len
   end
 end
 
 def draw_keys_with_buffer(screen_chars, positions, keys, key_len)
-  File.open(Config.pane_tty_file, 'a') do |tty|
-    output = String.new
-    cursor = 0
-    positions.each_with_index do |pos, i|
-      output << "#{Config.gray}#{screen_chars[cursor..pos-1].to_s.gsub("\n", "\n\r")}"
-      output << "#{Config.red}#{keys[i]}"
-      cursor = [pos + key_len - (Config.keys_position == 'off_left' ? key_len : 0), 0].max
-    end
-    output << "#{Config.gray}#{screen_chars[cursor..-1].to_s.gsub("\n", "\n\r")}"
-    output << HOME_SEQ
-    tty << output
-  end
+  # Legacy; not used.
+  draw_keys_with_overlay screen_chars, positions, keys, key_len
 end
 
 def draw_keys_with_cursor(screen_chars, positions, keys, key_len)
   File.open(Config.pane_tty_file, 'a') do |tty|
+    output = String.new
     line = 0
     column = 0
     index = 0
@@ -307,10 +281,10 @@ def draw_keys_with_cursor(screen_chars, positions, keys, key_len)
             column
           end
 
-        tty << "\e[#{line + 1};#{draw_column + 1}H"
-        tty << Config.red
-        tty << keys[index]
-        tty << RESET_COLORS
+        output << "\e[#{line + 1};#{draw_column + 1}H"
+        output << Config.red
+        output << keys[index]
+        output << RESET_COLORS
 
         index += 1
         target = positions[index]
@@ -332,16 +306,72 @@ def draw_keys_with_cursor(screen_chars, positions, keys, key_len)
           column
         end
 
-      tty << "\e[#{line + 1};#{draw_column + 1}H"
-      tty << Config.red
-      tty << keys[index]
-      tty << RESET_COLORS
+      output << "\e[#{line + 1};#{draw_column + 1}H"
+      output << Config.red
+      output << keys[index]
+      output << RESET_COLORS
 
       index += 1
       target = positions[index]
     end
 
-    tty << HOME_SEQ
+    output << HOME_SEQ
+    tty << output
+  end
+end
+
+def draw_keys_with_overlay(screen_chars, positions, keys, key_len)
+  File.open(Config.pane_tty_file, 'a') do |tty|
+    base = String.new
+    # Paint full buffer once with background color
+    base << Config.gray
+    base << screen_chars.gsub("\n", "\n\r")
+    base << RESET_COLORS
+    # Now overlay markers using cursor addressing
+    line = 0
+    column = 0
+    positions_index = 0
+    target = positions[positions_index]
+    screen_chars.each_char.with_index do |char, idx|
+      break if target.nil?
+      while target == idx
+        draw_column =
+          if Config.keys_position == 'off_left'
+            [column - key_len, 0].max
+          else
+            column
+          end
+        base << "\e[#{line + 1};#{draw_column + 1}H"
+        base << Config.red
+        base << keys[positions_index]
+        base << RESET_COLORS
+        positions_index += 1
+        target = positions[positions_index]
+      end
+      if char == "\n"
+        line += 1
+        column = 0
+      else
+        column += 1
+      end
+    end
+    # Remaining markers if any after end (unlikely)
+    while target
+      draw_column =
+        if Config.keys_position == 'off_left'
+          [column - key_len, 0].max
+        else
+          column
+        end
+      base << "\e[#{line + 1};#{draw_column + 1}H"
+      base << Config.red
+      base << keys[positions_index]
+      base << RESET_COLORS
+      positions_index += 1
+      target = positions[positions_index]
+    end
+    base << HOME_SEQ
+    tty << base
   end
 end
 
@@ -426,6 +456,12 @@ def main
   Kernel.exit 0 if position_index.nil?
   jump_to = positions[position_index]
 
+  # Compute row/col from flat index within captured screen
+  prefix = screen_chars[0, jump_to]
+  row = prefix ? prefix.count("\n") : 0
+  last_nl = prefix ? prefix.rindex("\n") : nil
+  col = last_nl ? (jump_to - last_nl - 1) : jump_to
+
   # --- OPTIMIZED AND CORRECTED JUMP SEQUENCE ---
   # Enter copy-mode if not already
   `tmux copy-mode -t #{Config.pane_nr}`
@@ -439,8 +475,13 @@ def main
     `tmux send-keys -X -t #{Config.pane_nr} -N #{Config.scroll_position} cursor-down`
   end
 
-  # Move cursor to target
-  `tmux send-keys -X -t #{Config.pane_nr} -N #{jump_to} cursor-right`
+  # Move cursor to target row/col
+  if row > 0
+    `tmux send-keys -X -t #{Config.pane_nr} -N #{row} cursor-down`
+  end
+  if col > 0
+    `tmux send-keys -X -t #{Config.pane_nr} -N #{col} cursor-right`
+  end
 end
 
 if $PROGRAM_NAME == __FILE__
