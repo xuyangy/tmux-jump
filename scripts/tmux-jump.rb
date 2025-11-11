@@ -1,13 +1,14 @@
 #!/usr/bin/env ruby
 require 'timeout'
 require 'tempfile'
-require 'open3'
 
-# Read mode from arguments
-MODE = ARGV[0] || 'single'
+# Args: possible tmp_file then mode (for back-compat we detect file path)
+ARG_TMP = ARGV[0]
+ARG_MODE = ARGV[1]
+MODE = (ARG_MODE || ARG_TMP || 'single')
+EXTERNAL_TMP_FILE = (ARG_MODE ? ARG_TMP : nil)
 
 # SPECIAL STRINGS
-CLEAR_SEQ = "\e[2J"
 HOME_SEQ = "\e[H"
 RESET_COLORS = "\e[0m"
 ENTER_ALTERNATE_SCREEN = "\e[?1049h"
@@ -15,12 +16,6 @@ RESTORE_NORMAL_SCREEN = "\e[?1049l"
 
 # CONFIG
 KEYS = (ENV['JUMP_KEYS'] || 'jfhgkdlsa').each_char.to_a
-SECOND_CHAR_TIMEOUT =
-  begin
-    Float(ENV['JUMP_SECOND_CHAR_TIMEOUT'] || 0.01)
-  rescue
-    0.01
-  end
 # If the user pauses longer than this after the first char, we treat it as a single-char jump.
 
 Config = Struct.new(
@@ -32,7 +27,6 @@ Config = Struct.new(
   :alternate_on,
   :scroll_position,
   :pane_height,
-  :tmp_file,
   # Added for performance
   :gray,
   :red,
@@ -88,7 +82,20 @@ def recover_alternate_screen_after
   returns
 end
 
-def prompt_char! # raises Timeout::Error
+def prompt_char!(external: nil) # raises Timeout::Error
+  # If external prompt file provided (shell already did tmux command-prompt), reuse it
+  # only when explicitly requested. Otherwise spawn our own prompt.
+  use_external = external.nil? ? false : external
+  if use_external && EXTERNAL_TMP_FILE
+    $external_reader ||= File.new(EXTERNAL_TMP_FILE, 'r')
+    begin
+      char = read_char_from_file $external_reader
+      return char
+    rescue Timeout::Error
+      return nil
+    end
+  end
+
   tmp_file = Tempfile.new 'tmux-jump'
   pid = Kernel.spawn(
     'tmux', 'command-prompt', '-1', '-p', 'char:',
@@ -119,7 +126,7 @@ def prompt_char! # raises Timeout::Error
   char
 end
 
-def read_char_from_file(tmp_file, timeout_seconds = 3) # raises Timeout::Error
+def read_char_from_file(tmp_file, timeout_seconds = 10) # raises Timeout::Error
   char = nil
   Timeout.timeout(timeout_seconds) do
     loop do
@@ -358,7 +365,7 @@ def prompt_position_index!(positions, screen_chars) # raises Timeout::Error
   keys = keys_for positions.size
   key_len = keys.first.size
   draw_keys_onto_tty screen_chars, positions, keys, key_len
-   char = prompt_char!
+   char = prompt_char!(external: false)
    return nil if char.nil? # Handle cancellation
 
    key_index = KEYS.index(char)
@@ -377,30 +384,25 @@ def prompt_position_index!(positions, screen_chars) # raises Timeout::Error
   end
 end
 
-def read_optional_second_char(file)
-  # Try to read a second char within a shorter timeout; if not, return nil.
-  if IO.select([file], nil, nil, SECOND_CHAR_TIMEOUT)
-    file.getc
-  else
-    nil
-  end
-end
+
 
 def main
   jump_to_chars = ''
   `tmux send-keys -X -t #{Config.pane_nr} cancel` if Config.pane_mode == '1'
+
   start = -Config.scroll_position
   ending = -Config.scroll_position + Config.pane_height - 1
   screen_chars =
     `tmux capture-pane -p -t #{Config.pane_nr} -S #{start} -E #{ending}`[0..-2].gsub("︎", '') # without colors
 
-  # puts "screen_chars: #{screen_chars}; #{screen_chars.size} chars"
-
-  first_char = prompt_char!
+  # Read the first character (prompt already running in tmux via shell script)
+  first_char = prompt_char!(external: true)
+  Kernel.exit 0 if first_char.nil?
   jump_to_chars << first_char
 
   if MODE == 'double'
-    second_char = prompt_char!
+    second_char = prompt_char!(external: true)
+    Kernel.exit 0 if second_char.nil?
     jump_to_chars << second_char
   end
 
