@@ -456,31 +456,22 @@ def main
   Kernel.exit 0 if position_index.nil?
   jump_to = positions[position_index]
 
-  # Compute row/col from flat index within captured screen
-  prefix = screen_chars[0, jump_to]
-  row = prefix ? prefix.count("\n") : 0
-  last_nl = prefix ? prefix.rindex("\n") : nil
-  col = last_nl ? (jump_to - last_nl - 1) : jump_to
-
-  # --- OPTIMIZED AND CORRECTED JUMP SEQUENCE ---
+  # --- JUMP SEQUENCE ---
   # Enter copy-mode if not already
   `tmux copy-mode -t #{Config.pane_nr}`
 
-  # Go to top of history and start of line
+  # Go to top of visible area and start of line
   `tmux send-keys -X -t #{Config.pane_nr} top-line`
   `tmux send-keys -X -t #{Config.pane_nr} start-of-line`
 
-  # Adjust for scroll offset by moving DOWN from the top of history
+  # Adjust for scroll offset by moving DOWN from the top
   if Config.scroll_position > 0
     `tmux send-keys -X -t #{Config.pane_nr} -N #{Config.scroll_position} cursor-down`
   end
 
-  # Move cursor to target row/col
-  if row > 0
-    `tmux send-keys -X -t #{Config.pane_nr} -N #{row} cursor-down`
-  end
-  if col > 0
-    `tmux send-keys -X -t #{Config.pane_nr} -N #{col} cursor-right`
+  # Move cursor to target position (cursor-right wraps at line ends)
+  if jump_to > 0
+    `tmux send-keys -X -t #{Config.pane_nr} -N #{jump_to} cursor-right`
   end
 end
 
