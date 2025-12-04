@@ -247,6 +247,28 @@ end
 
 # Extended: supports 1-char or 2-char sequences.
 
+# Return an approximate terminal column width for a character.
+def char_width(char)
+  cp = char.ord
+  # Control characters and DEL / C1 controls
+  return 0 if cp <= 0x1f || (cp >= 0x7f && cp <= 0x9f)
+
+  # Rough East Asian Wide / Emoji ranges (wcwidth-like)
+  return 2 if (0x1100..0x115f).cover?(cp) ||
+              (0x2329..0x232a).cover?(cp) ||
+              (0x2e80..0xa4cf).cover?(cp) ||
+              (0xac00..0xd7a3).cover?(cp) ||
+              (0xf900..0xfaff).cover?(cp) ||
+              (0xfe10..0xfe19).cover?(cp) ||
+              (0xfe30..0xfe6f).cover?(cp) ||
+              (0xff00..0xff60).cover?(cp) ||
+              (0xffe0..0xffe6).cover?(cp) ||
+              (0x1f300..0x1f64f).cover?(cp) ||
+              (0x1f900..0x1f9ff).cover?(cp)
+
+  1
+end
+
 def draw_keys_onto_tty(screen_chars, positions, keys, key_len)
   if Config.alternate_on == '1'
     # Existing pane already has content; overlay markers only.
@@ -294,7 +316,7 @@ def draw_keys_with_cursor(screen_chars, positions, keys, key_len)
         line += 1
         column = 0
       else
-        column += 1
+        column += char_width(char)
       end
     end
 
@@ -352,7 +374,7 @@ def draw_keys_with_overlay(screen_chars, positions, keys, key_len)
         line += 1
         column = 0
       else
-        column += 1
+        column += char_width(char)
       end
     end
     # Remaining markers if any after end (unlikely)
