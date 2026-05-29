@@ -158,6 +158,13 @@ rescue Timeout::Error, Interrupt
   nil
 end
 
+def cleanup_prompt_file
+  return if PROMPT_FILE.nil? || PROMPT_FILE.empty?
+
+  File.delete(PROMPT_FILE) if File.exist?(PROMPT_FILE)
+rescue StandardError
+end
+
 def async_read_char_from_file!(tmp_file, result_queue)
   thread = Thread.new do
     begin
@@ -551,5 +558,9 @@ if $PROGRAM_NAME == __FILE__
   Config.red  = (fg_opt.empty? ? (ENV['JUMP_FOREGROUND_COLOR'] || "\e[1m\e[31m") : fg_opt).gsub('\\e', "\e")
   Config.keys_position = pos_opt.empty? ? (ENV['JUMP_KEYS_POSITION'] || 'left') : pos_opt
 
-  main
+  begin
+    main
+  ensure
+    cleanup_prompt_file
+  end
 end

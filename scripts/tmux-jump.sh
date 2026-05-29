@@ -25,25 +25,11 @@ fi
 # Start Ruby before the prompt returns so pane capture and option lookup can run
 # while the user is choosing the target character.
 "$ruby_path" "$current_dir/tmux-jump.rb" "$mode" --prompt-file "$prompt_file" &
-worker_pid=$!
-trap 'printf "\033" > "$prompt_file"; wait "$worker_pid" 2>/dev/null; rm -f "$prompt_file"' EXIT
-
-finish_prompt() {
-  if [[ ! -s "$prompt_file" ]]; then
-    printf '\033' > "$prompt_file"
-  fi
-
-  wait "$worker_pid" 2>/dev/null
-  rm -f "$prompt_file"
-  trap - EXIT
-}
 
 # Use tmux command-prompt so the prompt shows instantly and Esc cancels immediately.
 if [[ "$mode" == "single" ]]; then
   tmux command-prompt -1 -p 'char:' "run-shell 'printf %s \"%1\" > \"$prompt_file\"'"
-  finish_prompt
 elif [[ "$mode" == "double" ]]; then
-  # Two prompts in one invocation; ensure both show trailing ':'
-  tmux command-prompt -1 -p 'char1:,char2:' "run-shell 'printf %s \"%1%2\" > \"$prompt_file\"'"
-  finish_prompt
+  # Use two single prompts so each callback only substitutes its own character.
+  tmux command-prompt -1 -p 'char1:' "run-shell 'printf %s \"%%\" > \"$prompt_file\"; tmux command-prompt -1 -p \"char2:\" \"run-shell '\''printf %s \\\"%%\\\" >> \\\"$prompt_file\\\"'\''\"'"
 fi
