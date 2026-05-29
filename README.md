@@ -67,6 +67,11 @@ set -g @jump-bg-color '\e[0m\e[90m'
 set -g @jump-fg-color '\e[1m\e[31m'
 ```
 
+You can choose which Ruby executable runs the plugin:
+```
+set -g @jump-ruby-path '/usr/local/opt/ruby/bin/ruby'
+```
+
 And the keys position:
 ```
 # keys will overlap with the word (default)

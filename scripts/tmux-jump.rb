@@ -4,10 +4,17 @@ require 'tempfile'
 
 # Args: mode then optional pre-read chars (from tmux command-prompt)
 # Supports either a single combined string (e.g., "%1%2") or two separate args (%1 %2)
-MODE = (ARGV[0] || 'single')
-ARG_FIRST = ARGV[1]
-ARG_SECOND = ARGV[2]
-PRECHARS = ARGV[1] # backward compatibility when both chars are concatenated in one arg
+args = ARGV.dup
+MODE = (args.shift || 'single')
+prompt_file = nil
+if args[0] == '--prompt-file'
+  args.shift
+  prompt_file = args.shift
+end
+PROMPT_FILE = prompt_file
+ARG_FIRST = args[0]
+ARG_SECOND = args[1]
+PRECHARS = args[0] # backward compatibility when both chars are concatenated in one arg
 
 # SPECIAL STRINGS
 HOME_SEQ = "\e[H"
@@ -131,6 +138,24 @@ def read_char_from_file(tmp_file, timeout_seconds = 10) # raises Timeout::Error
     return nil
   end
   char
+end
+
+def read_chars_from_prompt_file(path, char_count, timeout_seconds = 10)
+  chars = nil
+  Timeout.timeout(timeout_seconds) do
+    loop do
+      data = File.exist?(path) ? File.binread(path) : ''
+      return nil if data.start_with?("\e")
+
+      chars = data.each_char.first(char_count).join
+      break if chars.length >= char_count
+
+      sleep 0.005
+    end
+  end
+  chars
+rescue Timeout::Error, Interrupt
+  nil
 end
 
 def async_read_char_from_file!(tmp_file, result_queue)
@@ -442,21 +467,8 @@ def main
   screen_chars =
     `tmux capture-pane -p -t #{Config.pane_nr} -S #{start} -E #{ending}`[0..-2].gsub("︎", '') # without colors
 
-  # Read the first character (prompt already running in tmux via shell script)
-  first_char = ARG_FIRST || (PRECHARS && PRECHARS[0]) || prompt_char!
-  Kernel.exit 0 if first_char.nil?
-  jump_to_chars << first_char
-
-  if MODE == 'double'
-    second_char = ARG_SECOND || (PRECHARS && PRECHARS[1]) || prompt_char!
-    Kernel.exit 0 if second_char.nil?
-    jump_to_chars << second_char
-  end
-
-  # Cancel tmux copy-mode prompt if we were in command mode.
-  `tmux send-keys -X -t #{Config.pane_nr} cancel` if Config.pane_mode == '1'
-
-  # Resolve jump mode from tmux options with env fallbacks
+  # Resolve jump mode from tmux options with env fallbacks while the prompt can
+  # still be waiting for input.
   if MODE == 'double'
     jm = `tmux show-option -gqv '@jump-mode-double'`.strip
     jump_mode = (jm.empty? ? (ENV['JUMP_MODE_DOUBLE'] || 'char') : jm)
@@ -464,6 +476,25 @@ def main
     jm = `tmux show-option -gqv '@jump-mode-single'`.strip
     jump_mode = (jm.empty? ? (ENV['JUMP_MODE_SINGLE'] || 'word') : jm)
   end
+
+  prompted_chars =
+    if PROMPT_FILE && !PROMPT_FILE.empty?
+      read_chars_from_prompt_file(PROMPT_FILE, MODE == 'double' ? 2 : 1)
+    end
+
+  # Read the first character (prompt already running in tmux via shell script)
+  first_char = ARG_FIRST || (PRECHARS && PRECHARS[0]) || (prompted_chars && prompted_chars[0]) || prompt_char!
+  Kernel.exit 0 if first_char.nil?
+  jump_to_chars << first_char
+
+  if MODE == 'double'
+    second_char = ARG_SECOND || (PRECHARS && PRECHARS[1]) || (prompted_chars && prompted_chars[1]) || prompt_char!
+    Kernel.exit 0 if second_char.nil?
+    jump_to_chars << second_char
+  end
+
+  # Cancel tmux copy-mode prompt if we were in command mode.
+  `tmux send-keys -X -t #{Config.pane_nr} cancel` if Config.pane_mode == '1'
 
   # If punctuation or any non-word chars are used, force 'char' mode
   if jump_mode == 'word' && jump_to_chars.chars.any? { |c| (c =~ /\w/).nil? }
