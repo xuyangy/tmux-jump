@@ -1,20 +1,41 @@
 #!/usr/bin/env ruby
-require 'timeout'
-require 'tempfile'
-
-# Args: mode then optional pre-read chars (from tmux command-prompt)
-# Supports either a single combined string (e.g., "%1%2") or two separate args (%1 %2)
-args = ARGV.dup
-MODE = (args.shift || 'single')
-prompt_file = nil
-if args[0] == '--prompt-file'
-  args.shift
-  prompt_file = args.shift
-end
-PROMPT_FILE = prompt_file
-ARG_FIRST = args[0]
-ARG_SECOND = args[1]
-PRECHARS = args[0] # backward compatibility when both chars are concatenated in one arg
+# frozen_string_literal: true
+#
+# PERFORMANCE CONTRACT -- read before editing.
+#
+# This script runs on every jump keystroke and its budget is a few tens of
+# milliseconds, most of which is interpreter startup. The rules below are load
+# bearing; breaking any one of them costs more than everything else here saves.
+#
+#   * No `require`, ever, and no gems. scripts/tmux-jump.sh launches ruby with
+#     --disable-gems, which removes ~70% of interpreter startup (98ms -> 29ms
+#     measured). A single `require` of a stdlib that pulls in RubyGems, or any
+#     gem dependency at all, silently undoes that. `require "tempfile"` alone
+#     cost 17ms -- as much as the whole interpreter boot -- via delegate/tmpdir.
+#   * tmux round-trips cost ~10ms each, so they are enumerated here rather than
+#     estimated. This list is the complete ledger for one jump:
+#
+#       worker, always     1  startup chain -- geometry + @jump-* options +
+#                             screen, in a single display-message chain
+#       worker, always     1  jump chain -- copy-mode + cursor moves (on success)
+#       worker, double     1  command-prompt for the second search char
+#       worker, per marker 1  command-prompt per marker level -- none when the
+#                             search char matches exactly once
+#       worker, alt screen 1  capture-pane -ep, only when the pane runs a
+#                             full-screen program (recover_alternate_screen_after)
+#       launcher, always   1  command-prompt for the first search char
+#
+#     So the floor is two worker round-trips (single mode, unique match, normal
+#     screen) and three in double mode. Any invocation not on this list is a
+#     regression: measure it, add it here, or do not add it.
+#   * Never shell out. Ruby backticks fork /bin/sh -c first: 14.4ms per call
+#     versus 9.6ms for IO.popen with an argv array.
+#   * No per-character Ruby iteration over the screen. each_char allocates a
+#     String and dispatches a block per character; screen-wide work must use
+#     C-implemented primitives (index, count, rindex, ascii_only?) over the
+#     precomputed line table.
+#   * No polling on the keypress path. The prompt handoff is a FIFO plus
+#     IO.select, so the wake is immediate.
 
 # SPECIAL STRINGS
 HOME_SEQ = "\e[H"
@@ -29,7 +50,6 @@ KEYS = (ENV['JUMP_KEYS'] || 'jfhgkdlsa').each_char.to_a
 Config = Struct.new(
   :pane_nr,
   :pane_tty_file,
-  :pane_mode,
   :cursor_y,
   :cursor_x,
   :alternate_on,
@@ -38,10 +58,133 @@ Config = Struct.new(
   # Added for performance
   :gray,
   :red,
-  :keys_position
+  :keys_position,
+  :mode_single,
+  :mode_double,
+  # Invocation arguments. Held here rather than in load-time constants read from
+  # ARGV so that this file can be required (by the specs) without picking up the
+  # requiring process's own argv.
+  :mode,
+  :prompt_file,
+  :cancel_file,
+  :arg_first,
+  :arg_second
 ).new
 
+# Args: mode then optional pre-read chars (from tmux command-prompt).
+# Supports either a single combined string (e.g. "%1%2") or two separate args.
+def parse_argv!(argv)
+  args = argv.dup
+  Config.mode = (args.shift || 'single')
+  loop do
+    case args[0]
+    when '--prompt-file'
+      args.shift
+      Config.prompt_file = args.shift
+    when '--cancel-file'
+      args.shift
+      Config.cancel_file = args.shift
+    else
+      break
+    end
+  end
+  Config.arg_first = args[0]
+  Config.arg_second = args[1]
+end
+
 # METHODS
+
+# Set JUMP_DEBUG=1 to let tmux's stderr through. It is discarded by default so a
+# failing command cannot scribble on the pane, but tmux reports a malformed -S/-E
+# by silently falling back to 0, so this is often the only diagnostic available.
+DEBUG = !(ENV['JUMP_DEBUG'] || '').empty?
+
+# Run tmux with an argv array so no /bin/sh is forked. Returns stdout.
+def tmux(*args)
+  opts = DEBUG ? {} : { err: File::NULL }
+  IO.popen(['tmux', *args], **opts, &:read)
+end
+
+# Fire-and-forget: we never read the output of the jump chain.
+def tmux!(*args)
+  err = DEBUG ? 2 : File::NULL
+  Process.wait Kernel.spawn('tmux', *args, out: File::NULL, err: err)
+end
+
+# Fields for the startup chain, in order. Tab-separated on ONE line: colour
+# values legitimately contain ';' and could contain '\n', but never a tab, and
+# a single field line means we never depend on capture-pane emitting exactly
+# pane_height lines (blank bottom rows and clipped ranges both break that).
+# pane_in_mode is deliberately absent: the copy-mode cancel is done by the
+# if-shell in the same chain, so nothing in Ruby needs to know.
+STARTUP_FIELDS = %w[
+  pane_id pane_tty cursor_y cursor_x alternate_on
+  scroll_position pane_height
+  @jump-bg-color @jump-fg-color @jump-keys-position
+  @jump-mode-single @jump-mode-double
+].freeze
+
+# tmux format-expands capture-pane's -S/-E, which is what lets the geometry, the
+# options and the correctly-scrolled screen arrive in a single round-trip.
+#
+# -E is pane_height - (scroll_position + 1), i.e. -scroll_position +
+# pane_height - 1 rearranged so the nested #{e|...} forms stay non-negative.
+# An empty scroll_position (the pane is not in copy mode) evaluates to 0 in this
+# arithmetic, which is what we want; a bare "-#{scroll_position}" would degrade
+# to "-S -" and capture the ENTIRE history, so the multiply form is deliberate.
+CAPTURE_START = '#{e|*:-1,#{scroll_position}}'
+CAPTURE_END = '#{e|-:#{pane_height},#{e|+:#{scroll_position},1}}'
+
+# WARNING: a malformed CAPTURE_START/CAPTURE_END does NOT fail. tmux treats an
+# unparseable -S/-E as 0, so a typo here silently captures the live bottom of
+# the pane instead of the scrolled view and every jump lands on the wrong
+# screen. spec/ asserts this range against a known-good literal -S/-E pair.
+#
+# No -t on either command, so both resolve the same default target. Adding -t to
+# one without the other would let them disagree about which pane they describe.
+#
+# On TMUX_PANE: it is exported to run-shell children. Whether it tracks the pane
+# the key was pressed in is unconfirmed, so targeting deliberately does not use
+# it -- the default target is what the rest of this file already relies on.
+def read_startup_state!
+  out = tmux(
+    'display-message', '-p', '-F', STARTUP_FIELDS.map { |f| "\#{#{f}}" }.join("\t"),
+    ';', 'capture-pane', '-p', '-S', CAPTURE_START, '-E', CAPTURE_END,
+    ';', 'if-shell', '-F', '#{pane_in_mode}', 'send-keys -X cancel'
+  )
+  field_line, screen = out.split("\n", 2)
+  fields = field_line.to_s.split("\t", -1)
+
+  Config.pane_nr = fields[0]
+  Config.pane_tty_file = fields[1]
+  Config.cursor_y = fields[2]
+  Config.cursor_x = fields[3]
+  Config.alternate_on = fields[4]
+  Config.scroll_position = fields[5].to_i
+  Config.pane_height = fields[6].to_i
+
+  apply_option_defaults!(fields[7], fields[8], fields[9], fields[10], fields[11])
+
+  # capture-pane ends with a newline; drop it, not a trailing blank screen row.
+  screen = screen.to_s
+  screen = screen[0..-2] if screen.end_with?("\n")
+  screen.gsub("\u{FE0E}", '')
+end
+
+# Resolve the @jump-* options against env fallbacks and built-in defaults. Kept
+# out of read_startup_state! so it is reachable without a live tmux -- otherwise
+# Config.red is nil and the draw path raises TypeError under test.
+def apply_option_defaults!(bg = nil, fg = nil, pos = nil, mode_single = nil, mode_double = nil)
+  bg = bg.to_s.strip
+  fg = fg.to_s.strip
+  pos = pos.to_s.strip
+  Config.gray = (bg.empty? ? (ENV['JUMP_BACKGROUND_COLOR'] || "\e[48;5;240m") : bg).gsub('\\e', "\e")
+  Config.red = (fg.empty? ? (ENV['JUMP_FOREGROUND_COLOR'] || "\e[1m\e[31m") : fg).gsub('\\e', "\e")
+  Config.keys_position = pos.empty? ? (ENV['JUMP_KEYS_POSITION'] || 'left') : pos
+  Config.mode_single = mode_single.to_s.strip
+  Config.mode_double = mode_double.to_s.strip
+end
+
 def recover_screen_after
   if Config.alternate_on == '1'
     recover_alternate_screen_after { yield }
@@ -57,7 +200,7 @@ def recover_normal_screen_after
   returns = nil
   begin
     returns = yield
-  rescue Timeout::Error, Interrupt
+  rescue Interrupt
     # user took too long, or pressed Ctrl-C, but we recover anyways
   ensure
     File.open(Config.pane_tty_file, 'a') do |tty|
@@ -69,7 +212,7 @@ end
 
 def recover_alternate_screen_after
   saved_screen =
-    `tmux capture-pane -ep -t #{Config.pane_nr}`[0..-2] # with colors...
+    tmux('capture-pane', '-ep', '-t', Config.pane_nr)[0..-2] # with colors...
       .gsub("\n", "\n\r")
   File.open(Config.pane_tty_file, 'a') do |tty|
     tty << HOME_SEQ
@@ -77,7 +220,7 @@ def recover_alternate_screen_after
   returns = nil
   begin
     returns = yield
-  rescue Timeout::Error, Interrupt
+  rescue Interrupt
     # user took too long, or pressed Ctrl-C, but we recover anyways
   ensure
     File.open(Config.pane_tty_file, 'a') do |tty|
@@ -90,107 +233,114 @@ def recover_alternate_screen_after
   returns
 end
 
-def prompt_char! # raises Timeout::Error
-  tmp_file = Tempfile.new 'tmux-jump'
-  pid = Kernel.spawn(
-    'tmux', 'command-prompt', '-1', '-p', 'char:',
-    "run-shell \"printf '%1' >> #{tmp_file.path}\""
-  )
+PROMPT_TIMEOUT = 10
+# How long to keep waiting for a character after the prompt process has already
+# exited. Submitting the prompt makes `tmux command-prompt` return and fires the
+# run-shell write, so the two race; only the cancel path ever waits this out.
+PROMPT_EXIT_GRACE = 0.05
 
-  result_queue = Queue.new
-  thread_0 = async_read_char_from_file! tmp_file, result_queue
-  thread_1 = async_detect_prompt_exit pid, tmp_file, result_queue
+# Open a FIFO for reading without blocking on a writer, and keep a write end
+# open in this process. Holding the write end means a writer closing -- each
+# `printf > fifo` from tmux is a separate open/close -- never surfaces as EOF,
+# which would otherwise make IO.select return readable forever and turn this
+# back into a busy loop.
+def open_prompt_fifo(path)
+  File.open(path, File::RDWR | File::NONBLOCK)
+end
 
-  char = nil
-  begin
-    char = result_queue.pop
-  rescue Interrupt
-    thread_0.kill
-    thread_1.kill
-    # try to cancel any active tmux prompt so it doesn't linger
+# Block until `char_count` complete characters are available. No polling: the
+# only wait is IO.select, which wakes the moment tmux writes.
+def read_chars_from_fifo(io, char_count, timeout_seconds = PROMPT_TIMEOUT, cancel_io = nil)
+  buf = String.new(encoding: Encoding::BINARY)
+  watched = cancel_io ? [io, cancel_io] : [io]
+  deadline_grace = nil
+
+  loop do
+    timeout = deadline_grace || timeout_seconds
+    ready, = IO.select(watched, nil, nil, timeout)
+    return nil if ready.nil? # timed out, or grace elapsed after prompt exit
+
+    if cancel_io && ready.include?(cancel_io)
+      # The prompt that fed this FIFO has resolved. Each prompt is read by
+      # exactly one call, so an empty buffer here means it was cancelled. A
+      # character can still be in flight -- the callback write and the prompt
+      # returning race -- so allow a short grace before giving up.
+      watched = [io]
+      deadline_grace = PROMPT_EXIT_GRACE
+      next unless ready.include?(io)
+    end
+
     begin
-      `tmux send-keys Escape`
-    rescue StandardError
+      buf << io.read_nonblock(64)
+    rescue IO::WaitReadable
+      next
     end
-    return nil
+
+    # Any control byte cancels, not just <Esc>. `command-prompt -1` appends the
+    # key verbatim (status.c handles PROMPT_SINGLE before the status-keys
+    # translation), so <Esc> arrives as 0x1b, C-c as 0x03, Enter as 0x0d and
+    # Backspace as 0x7f. None of them can be a jump target -- the captured screen
+    # holds no control characters -- and letting one through leaves an orphan
+    # char2: prompt on an aborted double jump.
+    #
+    # This line IS the cancel rule documented under "Cancelling a jump" in
+    # README.md. Keep the two in step: 0x01-0x1f and 0x7f abort, 0x20-0x7e and
+    # UTF-8 are jump targets.
+    first = buf.getbyte(0)
+    return nil if first && (first < 0x20 || first == 0x7f)
+
+    text = buf.dup.force_encoding(Encoding::UTF_8)
+    next unless text.valid_encoding? # partial multi-byte character
+    return text[0, char_count] if text.length >= char_count
   end
-
-  # Handle cancellation key (e.g., <Esc>)
-  return nil if char.nil? || char == "\e"
-
-  thread_0.kill
-  thread_1.kill
-
-  char
-end
-
-def read_char_from_file(tmp_file, timeout_seconds = 10) # raises Timeout::Error
-  char = nil
-  begin
-    Timeout.timeout(timeout_seconds) do
-      loop do
-        # busy waiting with files :/
-        break if char = tmp_file.getc
-        sleep 0.01
-      end
-    end
-  rescue Interrupt
-    return nil
-  end
-  char
-end
-
-def read_chars_from_prompt_file(path, char_count, timeout_seconds = 10)
-  chars = nil
-  Timeout.timeout(timeout_seconds) do
-    loop do
-      data = File.exist?(path) ? File.binread(path) : ''
-      return nil if data.start_with?("\e")
-
-      chars = data.each_char.first(char_count).join
-      break if chars.length >= char_count
-
-      sleep 0.005
-    end
-  end
-  chars
-rescue Timeout::Error, Interrupt
+rescue Interrupt
   nil
 end
 
-def cleanup_prompt_file
-  return if PROMPT_FILE.nil? || PROMPT_FILE.empty?
+# A FIFO at a plain $TMPDIR path. Tempfile would do this too, but requiring it
+# costs 17ms of interpreter startup -- see the performance contract at the top.
+def prompt_fifo_path!
+  path = Config.prompt_file
+  return path if path && !path.empty?
 
-  File.delete(PROMPT_FILE) if File.exist?(PROMPT_FILE)
-rescue StandardError
+  dir = ENV['TMPDIR'] || '/tmp'
+  path = File.join(dir, "tmux-jump-#{Process.pid}.fifo")
+  File.delete(path) if File.exist?(path)
+  File.mkfifo path
+  Config.prompt_file = path
+  path
 end
 
-def async_read_char_from_file!(tmp_file, result_queue)
-  thread = Thread.new do
-    begin
-      char = read_char_from_file tmp_file
-      result_queue.push char
-    rescue Timeout::Error, Interrupt
-      result_queue.push nil
-    ensure
-      tmp_file.close!
-    end
+def prompt_char!(label = 'char:')
+  path = prompt_fifo_path!
+  io = open_prompt_fifo path
+  cancel_r, cancel_w = IO.pipe
+  pid = Kernel.spawn(
+    'tmux', 'command-prompt', '-1', '-p', label,
+    "run-shell \"printf '%1' > #{path}\""
+  )
+  watcher = Thread.new do
+    Process.wait pid
+    cancel_w.write 'x'
+  rescue StandardError
+    nil
   end
-  thread.abort_on_exception = true
-  thread
+
+  read_chars_from_fifo(io, 1, PROMPT_TIMEOUT, cancel_r)
+ensure
+  watcher.kill if watcher
+  io.close if io
+  cancel_r.close if cancel_r
+  cancel_w.close if cancel_w
 end
 
-def async_detect_prompt_exit(pid, tmp_file, result_queue)
-  Thread.new do
-    Process.wait(pid)
-    # The prompt process has finished.
-    # Give a tiny bit of time for the filesystem to catch up, just in case.
-    sleep 0.01
-    # If the other thread hasn't already found a character (file is empty),
-    # it means the prompt was cancelled.
-    if tmp_file.size == 0
-      result_queue.push nil
-    end
+def cleanup_prompt_file
+  [Config.prompt_file, Config.cancel_file].each do |path|
+    next if path.nil? || path.empty?
+
+    File.delete(path) if File.exist?(path)
+  rescue StandardError
+    nil
   end
 end
 
@@ -282,8 +432,30 @@ end
 # Return an approximate terminal column width for a character.
 def char_width(char)
   cp = char.ord
+  # Printable ASCII fast path. This is almost every character on a normal
+  # screen, and it skips the dozen Range#cover? tests below.
+  return 1 if cp >= 0x20 && cp < 0x7f
+
   # Control characters and DEL / C1 controls
   return 0 if cp <= 0x1f || (cp >= 0x7f && cp <= 0x9f)
+
+  # Zero-width: combining marks, variation selectors and the zero-width
+  # space/joiner group. tmux packs these into the preceding cell, so counting
+  # them as 1 column shifts every marker after them on the line.
+  return 0 if (0x0300..0x036f).cover?(cp) ||   # combining diacritical marks
+              (0x0483..0x0489).cover?(cp) ||
+              (0x0591..0x05bd).cover?(cp) ||
+              (0x0610..0x061a).cover?(cp) ||
+              (0x064b..0x065f).cover?(cp) ||
+              (0x0670..0x0670).cover?(cp) ||
+              (0x1ab0..0x1aff).cover?(cp) ||   # combining diacriticals ext.
+              (0x1dc0..0x1dff).cover?(cp) ||   # combining diacriticals suppl.
+              (0x200b..0x200f).cover?(cp) ||   # ZWSP / ZWNJ / ZWJ / LRM / RLM
+              (0x20d0..0x20f0).cover?(cp) ||   # combining marks for symbols
+              (0xfe00..0xfe0f).cover?(cp) ||   # variation selectors
+              (0xfe20..0xfe2f).cover?(cp) ||   # combining half marks
+              (0x1f3fb..0x1f3ff).cover?(cp) || # emoji skin-tone modifiers
+              (0xe0100..0xe01ef).cover?(cp)    # variation selectors suppl.
 
   # Rough East Asian Wide / Emoji ranges (wcwidth-like)
   return 2 if (0x1100..0x115f).cover?(cp) ||
@@ -311,121 +483,76 @@ def draw_keys_onto_tty(screen_chars, positions, keys, key_len)
   end
 end
 
-def draw_keys_with_buffer(screen_chars, positions, keys, key_len)
-  # Legacy; not used.
-  draw_keys_with_overlay screen_chars, positions, keys, key_len
+# Byte offsets of every line start, found with String#index (a C scan) instead of
+# walking characters in Ruby. Built once per draw and shared by both draw paths.
+def line_starts_of(screen_chars)
+  starts = [0]
+  at = 0
+  while (at = screen_chars.index("\n", at))
+    at += 1
+    starts << at
+  end
+  starts
+end
+
+# Display column of `index` within the line beginning at `line_start`.
+#
+# The ASCII fast path is what makes this cheap: for a line with no multi-byte
+# characters the column IS the offset, so no per-character work happens at all.
+# Only a genuinely wide/combining line pays for char_width, and only over that
+# one line's prefix rather than the whole screen.
+def column_of(screen_chars, line_start, index)
+  prefix = screen_chars[line_start...index]
+  return 0 if prefix.nil?
+  return prefix.length if prefix.ascii_only?
+
+  width = 0
+  prefix.each_char { |char| width += char_width(char) }
+  width
+end
+
+# The marker escape sequences, in position order. Emitted identically by both
+# draw paths, which previously carried two copies of this arithmetic.
+def marker_sequences(screen_chars, positions, keys, key_len)
+  starts = line_starts_of screen_chars
+  off_left = Config.keys_position == 'off_left'
+  red = Config.red
+  out = String.new
+  row = 0
+
+  positions.each_with_index do |target, key_index|
+    if target >= screen_chars.length
+      # Past the end of the screen: the original code left the cursor wherever
+      # the final character put it, i.e. the end of the last line.
+      row = starts.size - 1
+      column = column_of screen_chars, starts[row], screen_chars.length
+    else
+      # positions is ascending, so advance rather than search.
+      row += 1 while row + 1 < starts.size && starts[row + 1] <= target
+      column = column_of screen_chars, starts[row], target
+    end
+
+    column = column - key_len if off_left
+    column = 0 if column < 0
+
+    out << "\e[#{row + 1};#{column + 1}H" << red << keys[key_index] << RESET_COLORS
+  end
+
+  out << HOME_SEQ
+  out
 end
 
 def draw_keys_with_cursor(screen_chars, positions, keys, key_len)
   File.open(Config.pane_tty_file, 'a') do |tty|
-    output = String.new
-    line = 0
-    column = 0
-    index = 0
-    target = positions[index]
-
-    screen_chars.each_char.with_index do |char, idx|
-      break if target.nil?
-
-      while target == idx
-        draw_column =
-          if Config.keys_position == 'off_left'
-            [column - key_len, 0].max
-          else
-            column
-          end
-
-        output << "\e[#{line + 1};#{draw_column + 1}H"
-        output << Config.red
-        output << keys[index]
-        output << RESET_COLORS
-
-        index += 1
-        target = positions[index]
-      end
-
-      if char == "\n"
-        line += 1
-        column = 0
-      else
-        column += char_width(char)
-      end
-    end
-
-    while target
-      draw_column =
-        if Config.keys_position == 'off_left'
-          [column - key_len, 0].max
-        else
-          column
-        end
-
-      output << "\e[#{line + 1};#{draw_column + 1}H"
-      output << Config.red
-      output << keys[index]
-      output << RESET_COLORS
-
-      index += 1
-      target = positions[index]
-    end
-
-    output << HOME_SEQ
-    tty << output
+    tty << marker_sequences(screen_chars, positions, keys, key_len)
   end
 end
 
 def draw_keys_with_overlay(screen_chars, positions, keys, key_len)
   File.open(Config.pane_tty_file, 'a') do |tty|
-    base = String.new
-    # Paint full buffer once with background color
-    base << Config.gray
-    base << screen_chars.gsub("\n", "\n\r")
-    base << RESET_COLORS
-    # Now overlay markers using cursor addressing
-    line = 0
-    column = 0
-    positions_index = 0
-    target = positions[positions_index]
-    screen_chars.each_char.with_index do |char, idx|
-      break if target.nil?
-      while target == idx
-        draw_column =
-          if Config.keys_position == 'off_left'
-            [column - key_len, 0].max
-          else
-            column
-          end
-        base << "\e[#{line + 1};#{draw_column + 1}H"
-        base << Config.red
-        base << keys[positions_index]
-        base << RESET_COLORS
-        positions_index += 1
-        target = positions[positions_index]
-      end
-      if char == "\n"
-        line += 1
-        column = 0
-      else
-        column += char_width(char)
-      end
-    end
-    # Remaining markers if any after end (unlikely)
-    while target
-      draw_column =
-        if Config.keys_position == 'off_left'
-          [column - key_len, 0].max
-        else
-          column
-        end
-      base << "\e[#{line + 1};#{draw_column + 1}H"
-      base << Config.red
-      base << keys[positions_index]
-      base << RESET_COLORS
-      positions_index += 1
-      target = positions[positions_index]
-    end
-    base << HOME_SEQ
-    tty << base
+    # Paint the whole buffer once with the background colour, then overlay.
+    tty << Config.gray << screen_chars.gsub("\n", "\n\r") << RESET_COLORS
+    tty << marker_sequences(screen_chars, positions, keys, key_len)
   end
 end
 
@@ -437,7 +564,7 @@ def keys_for(position_count, keys = KEYS)
   end
 end
 
-def prompt_position_index!(positions, screen_chars) # raises Timeout::Error
+def prompt_position_index!(positions, screen_chars)
   return nil if positions.empty?
   return 0 if positions.size == 1
 
@@ -465,43 +592,61 @@ end
 
 
 
-def main
-  jump_to_chars = ''
-  `tmux send-keys -X -t #{Config.pane_nr} cancel` if Config.pane_mode == '1'
+def main(screen_chars)
+  # String.new, not '': the frozen_string_literal pragma above makes literals
+  # frozen, and this one is appended to.
+  jump_to_chars = String.new
 
-  start = -Config.scroll_position
-  ending = -Config.scroll_position + Config.pane_height - 1
-  screen_chars =
-    `tmux capture-pane -p -t #{Config.pane_nr} -S #{start} -E #{ending}`[0..-2].gsub("︎", '') # without colors
-
-  # Resolve jump mode from tmux options with env fallbacks while the prompt can
-  # still be waiting for input.
-  if MODE == 'double'
-    jm = `tmux show-option -gqv '@jump-mode-double'`.strip
+  # Jump mode, with env fallbacks. Both @jump-mode-* options already arrived
+  # with the pane data, so this costs no tmux round-trip.
+  double = Config.mode == 'double'
+  if double
+    jm = Config.mode_double.to_s
     jump_mode = (jm.empty? ? (ENV['JUMP_MODE_DOUBLE'] || 'char') : jm)
   else
-    jm = `tmux show-option -gqv '@jump-mode-single'`.strip
+    jm = Config.mode_single.to_s
     jump_mode = (jm.empty? ? (ENV['JUMP_MODE_SINGLE'] || 'word') : jm)
   end
 
+  prompt_path = Config.prompt_file
+  launcher_prompt = prompt_path && !prompt_path.empty? && Config.arg_first.nil?
   prompted_chars =
-    if PROMPT_FILE && !PROMPT_FILE.empty?
-      read_chars_from_prompt_file(PROMPT_FILE, MODE == 'double' ? 2 : 1)
+    if launcher_prompt
+      io = open_prompt_fifo prompt_path
+      # The launcher signals on this channel as each prompt resolves, so <Esc>
+      # aborts immediately instead of waiting out PROMPT_TIMEOUT.
+      cancel_path = Config.cancel_file
+      cancel_io = open_prompt_fifo(cancel_path) if cancel_path && !cancel_path.empty?
+      begin
+        # One character: the launcher only ever opens one prompt. In double mode
+        # the second prompt is opened below, via prompt_char!, so that <Esc> on
+        # the first character aborts without leaving an orphan prompt behind.
+        read_chars_from_fifo(io, 1, PROMPT_TIMEOUT, cancel_io)
+      ensure
+        io.close
+        cancel_io.close if cancel_io
+      end
     end
 
+  # A launcher prompt that yielded nothing was cancelled (or timed out). That is
+  # a definitive answer -- fall through to prompt_char! here and the user gets a
+  # SECOND prompt popped in their face for a jump they just aborted.
+  Kernel.exit 0 if launcher_prompt && prompted_chars.nil?
+
   # Read the first character (prompt already running in tmux via shell script)
-  first_char = ARG_FIRST || (PRECHARS && PRECHARS[0]) || (prompted_chars && prompted_chars[0]) || prompt_char!
+  first_char = Config.arg_first || (prompted_chars && prompted_chars[0]) || prompt_char!
   Kernel.exit 0 if first_char.nil?
   jump_to_chars << first_char
 
-  if MODE == 'double'
-    second_char = ARG_SECOND || (PRECHARS && PRECHARS[1]) || (prompted_chars && prompted_chars[1]) || prompt_char!
+  if double
+    # Config.arg_first doubles as the legacy combined-chars form ("ab" in one
+    # arg), hence the [1] fallback here. Otherwise we open the second prompt
+    # ourselves -- reached only because the first character was accepted.
+    second_char = Config.arg_second || (Config.arg_first && Config.arg_first[1]) ||
+                  prompt_char!('char2:')
     Kernel.exit 0 if second_char.nil?
     jump_to_chars << second_char
   end
-
-  # Cancel tmux copy-mode prompt if we were in command mode.
-  `tmux send-keys -X -t #{Config.pane_nr} cancel` if Config.pane_mode == '1'
 
   # If punctuation or any non-word chars are used, force 'char' mode
   if jump_mode == 'word' && jump_to_chars.chars.any? { |c| (c =~ /\w/).nil? }
@@ -516,50 +661,77 @@ def main
   Kernel.exit 0 if position_index.nil?
   jump_to = positions[position_index]
 
-  # --- JUMP SEQUENCE ---
-  # Enter copy-mode if not already
-  `tmux copy-mode -t #{Config.pane_nr}`
+  jump_to_index! jump_to, screen_chars
+end
 
-  # Go to top of visible area and start of line
-  `tmux send-keys -X -t #{Config.pane_nr} top-line`
-  `tmux send-keys -X -t #{Config.pane_nr} start-of-line`
+# Translate a character index into `screen_chars` into the row / character
+# offset pair that copy-mode navigation needs.
+#
+# A linear `-N <index> cursor-right` must NOT be used. tmux 3.7 made the
+# end-of-line stop depend on `mode-keys` (grid_reader_cursor_right() gained an
+# `onemore` argument, set only for emacs mode). Under `mode-keys vi` the cursor
+# can no longer rest one past the last character, so crossing a line of length L
+# costs L moves, while that line costs L + 1 characters in `screen_chars` (its
+# chars plus the trailing "\n"). The error accumulates one column per line.
+# tmux 3.6a and earlier always allowed the extra stop, which is why the linear
+# form used to work.
+#
+# Row/column navigation avoids the issue entirely: the offset is always within
+# the line, so the end-of-line wrap never comes into play and the result is the
+# same for both `mode-keys` settings.
+def row_and_offset_of(index, screen_chars)
+  prefix = screen_chars[0, index]
+  row = prefix.count("\n")
+  last_newline = prefix.rindex("\n")
+  line_prefix = last_newline ? prefix[(last_newline + 1)..] : prefix
 
-  # Adjust for scroll offset by moving DOWN from the top
+  # Count grapheme clusters, not columns and not code points. One cursor-right
+  # crosses exactly one cell: a wide character occupies two columns but one
+  # cell, and tmux packs a base character together with its combining marks into
+  # a single cell. For an all-ASCII prefix clusters and code points coincide, and
+  # #ascii_only? is a cached-coderange check ~900x cheaper than segmenting, so
+  # the common case never segments at all.
+  offset =
+    if line_prefix.ascii_only?
+      line_prefix.length
+    else
+      line_prefix.each_grapheme_cluster.count
+    end
+
+  [row, offset]
+end
+
+def jump_to_index!(index, screen_chars)
+  row, offset = row_and_offset_of index, screen_chars
+  pane = Config.pane_nr
+
+  # No `start-of-line` here: it resolves to the start of the *logical* line,
+  # walking up through GRID_LINE_WRAPPED rows. When the top visible row is a
+  # wrap continuation (any long command or log line) that scrolls the view above
+  # row 0 of `screen_chars` and the row count below is applied from the wrong
+  # origin. `top-line` already leaves the cursor at row 0, column 0, and
+  # `cursor-up` preserves column 0, so it is redundant as well as harmful.
+  argv = ['copy-mode', '-t', pane, ';', 'send-keys', '-X', '-t', pane, 'top-line']
+
+  # `screen_chars` was captured `scroll_position` rows above the view that
+  # copy-mode opens on, so walk UP into the history to reach its first row.
   if Config.scroll_position > 0
-    `tmux send-keys -X -t #{Config.pane_nr} -N #{Config.scroll_position} cursor-down`
+    argv.concat [';', 'send-keys', '-X', '-t', pane, '-N', Config.scroll_position.to_s, 'cursor-up']
   end
+  argv.concat [';', 'send-keys', '-X', '-t', pane, '-N', row.to_s, 'cursor-down'] if row > 0
+  argv.concat [';', 'send-keys', '-X', '-t', pane, '-N', offset.to_s, 'cursor-right'] if offset > 0
 
-  # Move cursor to target position (cursor-right wraps at line ends)
-  if jump_to > 0
-    `tmux send-keys -X -t #{Config.pane_nr} -N #{jump_to} cursor-right`
-  end
+  tmux!(*argv)
 end
 
 if $PROGRAM_NAME == __FILE__
-  # Get pane data with a single tmux call for performance
-  format = '#{pane_id};#{pane_tty};#{pane_in_mode};#{cursor_y};#{cursor_x};'\
-           '#{alternate_on};#{scroll_position};#{pane_height}'
-  tmux_data = `tmux display-message -p -F "#{format}"`.strip.split(';')
-
-  Config.pane_nr = tmux_data[0]
-  Config.pane_tty_file = tmux_data[1]
-  Config.pane_mode = tmux_data[2]
-  Config.cursor_y = tmux_data[3]
-  Config.cursor_x = tmux_data[4]
-  Config.alternate_on = tmux_data[5]
-  Config.scroll_position = tmux_data[6].to_i
-  Config.pane_height = tmux_data[7].to_i
-
-  # Read color and position config from tmux options so chaining via run-shell preserves settings
-  bg_opt = `tmux show-option -gqv '@jump-bg-color'`.strip
-  fg_opt = `tmux show-option -gqv '@jump-fg-color'`.strip
-  pos_opt = `tmux show-option -gqv '@jump-keys-position'`.strip
-  Config.gray = (bg_opt.empty? ? (ENV['JUMP_BACKGROUND_COLOR'] || "\e[48;5;240m") : bg_opt).gsub('\\e', "\e")
-  Config.red  = (fg_opt.empty? ? (ENV['JUMP_FOREGROUND_COLOR'] || "\e[1m\e[31m") : fg_opt).gsub('\\e', "\e")
-  Config.keys_position = pos_opt.empty? ? (ENV['JUMP_KEYS_POSITION'] || 'left') : pos_opt
+  parse_argv! ARGV
+  # One round-trip: geometry, every @jump-* option, and the correctly-scrolled
+  # screen. Nothing looks at tmux again until the jump chain fires.
+  screen = read_startup_state!
 
   begin
-    main
+    main screen
   ensure
     cleanup_prompt_file
   end
