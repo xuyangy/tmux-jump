@@ -14,8 +14,43 @@ From now to then I think about how to improve my dev tools. Copy and pasting ins
 
 ## Requirements
 
-* [tmux](https://github.com/tmux/tmux) >= 3.1
-* [ruby](https://www.ruby-lang.org/) >= 2.3
+All of these are mandatory. The plugin is tuned for latency and deliberately
+does not carry fallbacks for older versions — a jump budget is a few tens of
+milliseconds, and compatibility shims cost more than they are worth.
+
+* [tmux](https://github.com/tmux/tmux) >= 3.7 — pane state and every `@jump-*`
+  option are read in a single format expansion, and cursor placement relies on
+  3.7's `mode-keys`-aware copy-mode cursor semantics.
+* [ruby](https://www.ruby-lang.org/) >= 3.4 — required for grapheme-cluster
+  cell counting and for interpreter startup, which dominates the jump budget.
+
+`@jump-ruby-path` is **required** — there is no interpreter search. Find the
+path with `brew --prefix ruby` (Homebrew lives at `/usr/local` on Intel Macs and
+`/opt/homebrew` on Apple Silicon), or `command -v ruby` otherwise:
+
+```sh
+# Intel macOS / Homebrew at /usr/local
+set -g @jump-ruby-path '/usr/local/opt/ruby/bin/ruby'
+```
+
+It is read once at plugin load and baked into the key binding, so it costs
+nothing per jump. Probing a list of likely locations was removed deliberately:
+it can land on macOS's system `ruby` (2.6), which fails as a *parse* error, so
+the plugin would silently do nothing. If the option is unset or not executable
+you get a message in the status line instead.
+
+Verify the interpreter you point at is new enough:
+
+```sh
+$ /usr/local/opt/ruby/bin/ruby -v
+ruby 3.4.4 ...
+```
+
+Ruby is launched with `--disable-gems`, which removes ~70% of interpreter
+startup (98ms → 29ms measured). Consequently the script has, and must keep,
+**zero `require`s and zero gem dependencies** — `require 'tempfile'` alone cost
+17ms, as much as the entire interpreter boot. See the performance contract at
+the top of `scripts/tmux-jump.rb` before changing anything in it.
 
 ## Installation via [TPM](https://github.com/tmux-plugins/tpm)
 
@@ -55,6 +90,40 @@ tmux source-file ~/.tmux.conf
 
 tmux-jump can also be used in in any program and during copy mode.
 
+### Cancelling a jump
+
+A jump can be aborted at any prompt. One press is always enough — the pane is
+left exactly as it was, and no further prompt appears.
+
+| Key | Effect |
+| --- | --- |
+| <kbd>Esc</kbd> | Cancels |
+| <kbd>Enter</kbd> | Cancels |
+| <kbd>Tab</kbd> | Cancels |
+| <kbd>Backspace</kbd> | Cancels |
+| <kbd>Ctrl</kbd> + any key | Cancels — includes <kbd>Ctrl</kbd>+<kbd>C</kbd>, <kbd>Ctrl</kbd>+<kbd>G</kbd>, <kbd>Ctrl</kbd>+<kbd>D</kbd> |
+| Arrow / function / <kbd>Home</kbd> / <kbd>End</kbd> / <kbd>PgUp</kbd> / <kbd>PgDn</kbd> | **Ignored** — the prompt stays open, waiting |
+| Any key that is not a marker key | Cancels, at the marker prompt only |
+| *(no key at all)* | Cancels after 10 seconds |
+
+The rule is that every control character cancels: bytes `0x01`–`0x1f` plus
+`0x7f`. Everything printable — `0x20`–`0x7e`, plus any UTF-8 character — is a
+jump target, so punctuation and <kbd>Space</kbd> are searchable and do not abort.
+
+Two notes on why the table looks the way it does:
+
+* <kbd>Esc</kbd> is not special-cased by tmux here. `command-prompt -1` appends
+  the pressed key verbatim (it handles `PROMPT_SINGLE` before the `status-keys`
+  translation), so <kbd>Esc</kbd> arrives as an ordinary `0x1b` character and
+  tmux-jump is what interprets it as "abort". This also means `status-keys vi`
+  has no effect on cancelling.
+* Special keys above `0x7f` that are not characters — arrows and friends — are
+  dropped by tmux before tmux-jump ever sees them, which is why they neither
+  jump nor cancel.
+
+In double-key mode both prompts cancel independently: aborting at `char1:` never
+opens `char2:`, and aborting at `char2:` ends the jump immediately.
+
 You can customize the key binding in your `.tmux.conf`:
 
 ```
@@ -67,7 +136,8 @@ set -g @jump-bg-color '\e[0m\e[90m'
 set -g @jump-fg-color '\e[1m\e[31m'
 ```
 
-You can choose which Ruby executable runs the plugin:
+The Ruby executable that runs the plugin. This one is **required**, not
+optional — see [Requirements](#requirements):
 ```
 set -g @jump-ruby-path '/usr/local/opt/ruby/bin/ruby'
 ```
