@@ -380,6 +380,8 @@ def positions_of_char(jump_to_chars, screen_chars)
       idx = -1
       while idx = screen_chars.index(needle, idx + 1)
         positions << idx
+        idx += 1
+        idx += 1 while needle[0] == needle[1] && screen_chars[idx + 1] == needle[0]
       end
     else
       hay = screen_chars.downcase
@@ -387,6 +389,8 @@ def positions_of_char(jump_to_chars, screen_chars)
       idx = -1
       while idx = hay.index(needle, idx + 1)
         positions << idx
+        idx += 1
+        idx += 1 while needle[0] == needle[1] && hay[idx + 1] == needle[0]
       end
     end
   end

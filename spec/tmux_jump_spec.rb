@@ -77,6 +77,15 @@ RSpec.describe 'tmux-jump' do
         expect(positions_of('e', simple_screen, 'char')).to eq [3, 10, 22, 47, 59]
         expect(positions_of('s', simple_screen, 'char')).to eq [24, 61]
       end
+
+      it 'returns one two-character match per repeated-character run' do
+        expect(positions_of('tt', 'tt ttt tTdd tttt', 'char')).to eq [0, 3, 7, 12]
+        expect(positions_of('TT', 'TT TTT tt', 'char')).to eq [0, 3]
+      end
+
+      it 'keeps distinct two-character matches separate' do
+        expect(positions_of('ab', 'ab ababab', 'char')).to eq [0, 3, 5, 7]
+      end
     end
 
     context 'in word mode' do
