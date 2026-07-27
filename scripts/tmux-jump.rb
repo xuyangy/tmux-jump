@@ -22,7 +22,10 @@
 #       worker, per marker 1  command-prompt per marker level -- none when the
 #                             search char matches exactly once
 #       worker, alt screen 1  capture-pane -ep, only when the pane runs a
-#                             full-screen program (recover_alternate_screen_after)
+#                             full-screen program (recover_alternate_screen_after).
+#                             Still exactly one however many marker levels the
+#                             jump takes: base_repaint reuses that same capture
+#                             to erase the previous level rather than re-asking.
 #       launcher, always   1  command-prompt for the first search char
 #
 #     So the floor is two worker round-trips (single mode, unique match, normal
@@ -40,6 +43,7 @@
 # SPECIAL STRINGS
 HOME_SEQ = "\e[H"
 RESET_COLORS = "\e[0m"
+ERASE_SCREEN = "\e[2J"
 ENTER_ALTERNATE_SCREEN = "\e[?1049h"
 RESTORE_NORMAL_SCREEN = "\e[?1049l"
 
@@ -53,6 +57,10 @@ Config = Struct.new(
   :cursor_y,
   :cursor_x,
   :alternate_on,
+  # The coloured capture a full-screen program's pane was holding when the jump
+  # started. Taken once by recover_alternate_screen_after and used twice: to
+  # repaint the base between marker levels, and to restore the pane on exit.
+  :saved_screen,
   :scroll_position,
   :pane_height,
   :history_size,
@@ -170,10 +178,19 @@ def read_startup_state!
   Config.history_size = fields[12].to_i
   Config.line_numbers = fields[13]
 
-  # capture-pane ends with a newline; drop it, not a trailing blank screen row.
+  trim_captured_screen screen
+end
+
+# capture-pane ends with a newline; drop it, not a trailing blank screen row.
+#
+# Variation selectors are deliberately NOT stripped. VS15 is the only evidence
+# that a wide emoji is being rendered narrow, and columns_of needs it; dropping it
+# left every marker after such a glyph one column right of its target. Both
+# selectors are width 0 and form one grapheme cluster with their base, so
+# carrying them costs the column and cursor arithmetic nothing.
+def trim_captured_screen(screen)
   screen = screen.to_s
-  screen = screen[0..-2] if screen.end_with?("\n")
-  screen.gsub("\u{FE0E}", '')
+  screen.end_with?("\n") ? screen[0..-2] : screen
 end
 
 # Resolve the @jump-* options against env fallbacks and built-in defaults. Kept
@@ -219,6 +236,7 @@ def recover_alternate_screen_after
   saved_screen =
     tmux('capture-pane', '-ep', '-t', Config.pane_nr)[0..-2] # with colors...
       .gsub("\n", "\n\r")
+  Config.saved_screen = saved_screen
   File.open(Config.pane_tty_file, 'a') do |tty|
     tty << HOME_SEQ
   end
@@ -229,6 +247,10 @@ def recover_alternate_screen_after
     # user took too long, or pressed Ctrl-C, but we recover anyways
   ensure
     File.open(Config.pane_tty_file, 'a') do |tty|
+      # Erase first, for the same reason base_repaint does: capture-pane trims
+      # trailing spaces, so a marker drawn past the end of a line has no captured
+      # character to overwrite it and would outlive the jump.
+      tty << RESET_COLORS << ERASE_SCREEN
       tty << HOME_SEQ
       tty << saved_screen
       tty << "\e[#{Config.cursor_y.to_i + 1};#{Config.cursor_x.to_i + 1}H"
@@ -438,6 +460,10 @@ end
 
 # Extended: supports 1-char or 2-char sequences.
 
+# Which pictographs take two cells. Built once: Regexp#match? on a literal is
+# cheap, but re-parsing this pattern per character would not be.
+WIDE_PICTOGRAPH = /[\p{Emoji_Presentation}\p{Emoji_Modifier_Base}]/
+
 # Return an approximate terminal column width for a character.
 def char_width(char)
   cp = char.ord
@@ -466,7 +492,30 @@ def char_width(char)
               (0x1f3fb..0x1f3ff).cover?(cp) || # emoji skin-tone modifiers
               (0xe0100..0xe01ef).cover?(cp)    # variation selectors suppl.
 
-  # Rough East Asian Wide / Emoji ranges (wcwidth-like)
+  # THE EMOJI PLANES ARE NOT UNIFORMLY WIDE, and treating them as if they were
+  # is what put the marker one column right of its target on any line following
+  # a prompt glyph. Unicode splits pictographs into emoji-default and
+  # text-default (Emoji_Presentation), and terminals honour the split: 🚀 🦉 🌭
+  # take two cells, while 🌧 🐿 🌶 🗺 🛠 -- the Unicode 7.0 additions, which are
+  # exactly what prompt themes reach for -- take one. Verified against a live
+  # tmux 3.7 rather than assumed; see spec/.
+  #
+  # \p{Emoji_Presentation} is the property itself rather than a hand-copied range
+  # list, so it stays right as Ruby's Unicode data moves. It costs a regex match
+  # per character, and that cost never lands on an ASCII row: columns_of takes
+  # the offset as the column outright for any line that is ascii_only?.
+  if (0x1f000..0x1fbff).cover?(cp)
+    # Enclosed Ideographic Supplement is East Asian Wide outright -- its width
+    # does not depend on emoji presentation, and tmux renders it two cells.
+    return 2 if (0x1f200..0x1f2ff).cover?(cp)
+
+    # Emoji_Modifier_Base picks up the five text-default pictographs that still
+    # render wide because they take a skin tone: 🏋 🏌 🕴 🕵 🖐. Without it those
+    # five are the only misses in a 112-case sweep against a live tmux.
+    return WIDE_PICTOGRAPH.match?(char) ? 2 : 1
+  end
+
+  # Rough East Asian Wide ranges (wcwidth-like)
   return 2 if (0x1100..0x115f).cover?(cp) ||
               (0x2329..0x232a).cover?(cp) ||
               (0x2e80..0xa4cf).cover?(cp) ||
@@ -476,19 +525,48 @@ def char_width(char)
               (0xfe30..0xfe6f).cover?(cp) ||
               (0xff00..0xff60).cover?(cp) ||
               (0xffe0..0xffe6).cover?(cp) ||
-              (0x1f300..0x1f64f).cover?(cp) ||
-              (0x1f900..0x1f9ff).cover?(cp)
+              (0x20000..0x3fffd).cover?(cp)      # CJK unified ext. B and later
 
   1
 end
 
-def draw_keys_onto_tty(screen_chars, positions, keys, key_len)
-  if Config.alternate_on == '1'
-    # Existing pane already has content; overlay markers only.
-    draw_keys_with_cursor screen_chars, positions, keys, key_len
+# MARKERS ARE NOT ERASED BY THE NEXT DRAW UNLESS THE BASE IS REPAINTED.
+#
+# A multi-level jump draws the screen once per level, and the levels do not
+# cover the same cells: level one writes a two-character key at every position,
+# level two writes a one-character key at the positions that survived. Drawing
+# only the new markers therefore leaves two kinds of debris behind --
+#
+#   * the second cell of the surviving key, so "jh" plus a level-two "h" reads
+#     as "hh" instead of "h", and
+#   * every marker belonging to a branch the keypress just eliminated, which
+#     stays on screen for the rest of the jump.
+#
+# Repainting the base screen before each level's markers is what removes both.
+# ERASE_SCREEN is needed on top of the repaint because neither base -- the plain
+# capture or the coloured one -- includes trailing spaces, so a marker drawn past
+# the end of a short line has no base character to overwrite it. That is the
+# `a` output row rendering as `ag` after a level-two `g`.
+def draw_keys_onto_tty(screen_chars, positions, keys, key_len, redraw = false)
+  File.open(Config.pane_tty_file, 'a') do |tty|
+    # In alternate-screen mode the pane's own content is already on screen, so
+    # the first level only overlays. Later levels have to repaint to erase.
+    tty << base_repaint(screen_chars) if redraw || Config.alternate_on != '1'
+    tty << marker_sequences(screen_chars, positions, keys, key_len)
+  end
+end
+
+# The unmarked screen, positioned at the home cell and cleared of anything a
+# previous level left outside it. Costs no tmux round-trip either way: the
+# alternate-screen base was captured by recover_alternate_screen_after before
+# the first draw, and the normal-screen base is the capture we already hold.
+def base_repaint(screen_chars)
+  base = RESET_COLORS + ERASE_SCREEN + HOME_SEQ
+  saved = Config.saved_screen
+  if Config.alternate_on == '1' && saved && !saved.empty?
+    base + saved
   else
-    # We entered a fresh alternate screen; need to paint base text then overlay markers.
-    draw_keys_with_overlay screen_chars, positions, keys, key_len
+    base + Config.gray + screen_chars.gsub("\n", "\n\r") + RESET_COLORS
   end
 end
 
@@ -504,20 +582,81 @@ def line_starts_of(screen_chars)
   starts
 end
 
-# Display column of `index` within the line beginning at `line_start`.
-#
-# The ASCII fast path is what makes this cheap: for a line with no multi-byte
-# characters the column IS the offset, so no per-character work happens at all.
-# Only a genuinely wide/combining line pays for char_width, and only over that
-# one line's prefix rather than the whole screen.
-def column_of(screen_chars, line_start, index)
-  prefix = screen_chars[line_start...index]
-  return 0 if prefix.nil?
-  return prefix.length if prefix.ascii_only?
+# The two variation selectors override the base character's default presentation,
+# and with it its width: VS15 asks for the narrow text glyph, VS16 for the wide
+# emoji one. Both matter now that char_width answers by default presentation --
+# "🌧" is one cell, "🌧\u{FE0F}" is two, and tmux agrees with both.
+TEXT_PRESENTATION = "\u{FE0E}"
+EMOJI_PRESENTATION = "\u{FE0F}"
 
-  width = 0
-  prefix.each_char { |char| width += char_width(char) }
-  width
+# Display column for each of `targets`, where targets[i] is a character index on
+# row rows[i]. Both arrays are in ascending order, which is what lets this walk
+# each row's characters at most once.
+#
+# ONE PASS PER ROW, NOT ONE PER MARKER. Resolving each marker independently
+# rescans its line from the start, so a row holding N markers costs N * its
+# length. That is invisible on ASCII -- the column simply IS the offset, and no
+# character is examined at all -- and quadratic the moment a row contains one
+# multi-byte character, which for a nerd-font `ls` listing or a TUI is every row.
+# Measured on a 60x190 screen carrying 1140 markers and one nerd-font glyph per
+# row: 36ms per draw resolving markers one at a time, 8ms walking each row once.
+# The same screen in pure ASCII is 1.4ms either way, which is why this went
+# unnoticed -- the spec/ performance fixtures were all ASCII.
+def columns_of(screen_chars, starts, rows, targets)
+  columns = Array.new(targets.size)
+  first = 0
+
+  while first < targets.size
+    row = rows[first]
+    line_start = starts[row]
+    line_end = screen_chars.index("\n", line_start) || screen_chars.length
+    # Every marker on this row, so the walk below is shared by all of them.
+    last = first
+    last += 1 while last + 1 < targets.size && rows[last + 1] == row
+
+    if screen_chars[line_start...line_end].ascii_only?
+      (first..last).each { |i| columns[i] = targets[i] - line_start }
+    else
+      at = first
+      index = line_start
+      width = 0
+      previous = 0
+      # Slice the line, not the tail of the screen: the tail would allocate
+      # O(screen) per row and put the quadratic cost straight back.
+      screen_chars[line_start...line_end].each_char do |char|
+        while at <= last && targets[at] == index
+          columns[at] = width
+          at += 1
+        end
+        break if at > last
+
+        case char
+        when TEXT_PRESENTATION
+          # Only a base that was counted wide narrows; a selector after an
+          # already narrow character must not steal a column, and an orphan one
+          # must not steal a column from whatever happens to precede it.
+          width -= 1 if previous == 2
+          previous = 1
+        when EMOJI_PRESENTATION
+          width += 1 if previous == 1
+          previous = 2
+        else
+          previous = char_width(char)
+          width += previous
+        end
+        index += 1
+      end
+      # Anything at or past the end of the line lands on the end of the line.
+      while at <= last
+        columns[at] = width
+        at += 1
+      end
+    end
+
+    first = last + 1
+  end
+
+  columns
 end
 
 # The marker escape sequences, in position order. Emitted identically by both
@@ -527,42 +666,36 @@ def marker_sequences(screen_chars, positions, keys, key_len)
   off_left = Config.keys_position == 'off_left'
   red = Config.red
   out = String.new
-  row = 0
 
-  positions.each_with_index do |target, key_index|
+  # Resolve every marker to a row first, so columns_of can share one walk per row.
+  rows = Array.new(positions.size)
+  targets = Array.new(positions.size)
+  row = 0
+  positions.each_with_index do |target, i|
     if target >= screen_chars.length
       # Past the end of the screen: the original code left the cursor wherever
       # the final character put it, i.e. the end of the last line.
-      row = starts.size - 1
-      column = column_of screen_chars, starts[row], screen_chars.length
+      rows[i] = starts.size - 1
+      targets[i] = screen_chars.length
     else
       # positions is ascending, so advance rather than search.
       row += 1 while row + 1 < starts.size && starts[row + 1] <= target
-      column = column_of screen_chars, starts[row], target
+      rows[i] = row
+      targets[i] = target
     end
+  end
 
-    column = column - key_len if off_left
+  columns = columns_of screen_chars, starts, rows, targets
+
+  columns.each_with_index do |column, key_index|
+    column -= key_len if off_left
     column = 0 if column < 0
 
-    out << "\e[#{row + 1};#{column + 1}H" << red << keys[key_index] << RESET_COLORS
+    out << "\e[#{rows[key_index] + 1};#{column + 1}H" << red << keys[key_index] << RESET_COLORS
   end
 
   out << HOME_SEQ
   out
-end
-
-def draw_keys_with_cursor(screen_chars, positions, keys, key_len)
-  File.open(Config.pane_tty_file, 'a') do |tty|
-    tty << marker_sequences(screen_chars, positions, keys, key_len)
-  end
-end
-
-def draw_keys_with_overlay(screen_chars, positions, keys, key_len)
-  File.open(Config.pane_tty_file, 'a') do |tty|
-    # Paint the whole buffer once with the background colour, then overlay.
-    tty << Config.gray << screen_chars.gsub("\n", "\n\r") << RESET_COLORS
-    tty << marker_sequences(screen_chars, positions, keys, key_len)
-  end
 end
 
 def keys_for(position_count, keys = KEYS)
@@ -573,13 +706,15 @@ def keys_for(position_count, keys = KEYS)
   end
 end
 
-def prompt_position_index!(positions, screen_chars)
+# `redraw` is true for every level after the first, i.e. exactly when markers
+# from the previous level are still on the screen and have to be erased.
+def prompt_position_index!(positions, screen_chars, redraw = false)
   return nil if positions.empty?
   return 0 if positions.size == 1
 
   keys = keys_for positions.size
   key_len = keys.first.size
-  draw_keys_onto_tty screen_chars, positions, keys, key_len
+  draw_keys_onto_tty screen_chars, positions, keys, key_len, redraw
    char = prompt_char!
    return nil if char.nil? # Handle cancellation
 
@@ -591,7 +726,7 @@ def prompt_position_index!(positions, screen_chars)
     range_ending = range_beginning + magnitude - 1
     remaining_positions = positions[range_beginning..range_ending]
     return nil if remaining_positions.nil?
-    lower_index = prompt_position_index!(remaining_positions, screen_chars)
+    lower_index = prompt_position_index!(remaining_positions, screen_chars, true)
     return nil if lower_index.nil?
     range_beginning + lower_index
   else

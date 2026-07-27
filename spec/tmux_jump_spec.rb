@@ -318,6 +318,92 @@ RSpec.describe 'tmux-jump' do
     end
   end
 
+  # Marker placement is in display columns, and the only thing standing between a
+  # character offset and a display column is this. Every case here is a real
+  # prompt: a glyph whose width is misjudged puts the marker on the character
+  # NEXT to the one the user aimed at, for every match on that line.
+  describe '#columns_of' do
+    # A single-line screen, so row 0 starts at offset 0 and the only target is
+    # the 'a' whose column is under test.
+    def column_of_a(line)
+      columns_of(line, [0], [0], [line.index('a')]).first
+    end
+
+    # All of these were measured against a live tmux 3.7 rather than reasoned
+    # about, because the emoji planes are not uniformly wide and guessing here is
+    # what produced the bug.
+    it 'gives text-default pictographs one cell and emoji-default ones two' do
+      expect(char_width("\u{1F327}")).to eq 1 # cloud with rain -- text default
+      expect(char_width("\u{1F3DD}")).to eq 1 # desert island
+      expect(char_width("\u{1F43F}")).to eq 1 # chipmunk
+      expect(char_width("\u{1F680}")).to eq 2 # rocket -- emoji default
+      expect(char_width("\u{1F7E2}")).to eq 2 # large green circle
+      expect(char_width("\u{1F989}")).to eq 2 # owl
+    end
+
+    it 'gives the skin-tone-capable text-default pictographs two cells' do
+      # Text default, but every terminal here renders them wide.
+      expect(char_width("\u{1F3CB}")).to eq 2 # weightlifter
+      expect(char_width("\u{1F575}")).to eq 2 # detective
+      expect(char_width("\u{1F590}")).to eq 2 # hand with fingers splayed
+    end
+
+    it 'places the marker on the target after a text-default prompt glyph' do
+      # The reported case: a "\u{1F327}  echo 'a" prompt. Calling the glyph wide
+      # put every marker on that line one column right of its target.
+      expect(column_of_a("\u{1F327}  echo (a")).to eq 9
+      expect(column_of_a("\u{1F327}\u{1F327} a")).to eq 3
+    end
+
+    it 'lets the variation selectors override the default presentation' do
+      expect(column_of_a("\u{1F327}\u{FE0E}  echo (a")).to eq 9  # VS15: stays narrow
+      expect(column_of_a("\u{1F327}\u{FE0F}  echo (a")).to eq 10 # VS16: becomes wide
+      expect(column_of_a("\u{1F680}\u{FE0E} a")).to eq 2         # VS15: narrows it
+    end
+
+    it 'does not let a selector move a character it does not apply to' do
+      expect(column_of_a("\u{2718}\u{FE0E} a")).to eq 2
+      expect(column_of_a("\u{FE0E} a")).to eq 1 # orphan selector
+    end
+
+    it 'counts wide and combining characters' do
+      expect(column_of_a("中文 a")).to eq 5
+      expect(column_of_a("é a")).to eq 2
+    end
+
+    it 'takes the offset as the column when the line is ascii' do
+      expect(columns_of('~$ echo hello', [0], [0], [8]).first).to eq 8
+    end
+
+    it 'resolves several markers on one row in a single walk' do
+      # The multi-target path the draw actually uses, on a row where the columns
+      # and the offsets disagree.
+      line = "\u{1F327}ab\u{1F680}cd"
+      expect(columns_of(line, [0], [0, 0, 0, 0], [1, 2, 3, 5])).to eq [1, 2, 3, 6]
+    end
+
+    it 'resolves markers spread across rows' do
+      screen = "\u{1F327}ab\nxy\n\u{1F680}z"
+      starts = line_starts_of screen
+      expect(starts).to eq [0, 4, 7]
+      # 'b' on row 0, 'y' on row 1, 'z' on row 2.
+      expect(columns_of(screen, starts, [0, 1, 2], [2, 5, 8])).to eq [2, 1, 2]
+    end
+  end
+
+  # The screen the rest of this file reasons about must still carry the variation
+  # selectors: column_of needs VS15 to know a wide emoji is being drawn narrow.
+  describe '#trim_captured_screen' do
+    it 'keeps variation selectors that the column arithmetic depends on' do
+      expect(trim_captured_screen("\u{1F327}\u{FE0E} $ ls\n")).to eq "\u{1F327}\u{FE0E} $ ls"
+    end
+
+    it 'drops the trailing newline but not a trailing blank row' do
+      expect(trim_captured_screen("a\nb\n")).to eq "a\nb"
+      expect(trim_captured_screen("a\n\n")).to eq "a\n"
+    end
+  end
+
   describe 'keys_for' do
     [
       [1, KEYS.size, 1],
@@ -373,6 +459,168 @@ RSpec.describe 'tmux-jump' do
         positions = (0..81).to_a
         expect(prompt_position_index!(positions, many_es_screen)).to eq 0
       end
+    end
+  end
+
+  # A multi-level jump draws once per level and the levels cover different cells:
+  # level one writes a two-character key at every position, level two writes a
+  # one-character key at the positions that survived. So asserting on the escape
+  # sequences of a single draw cannot see this class of bug at all -- the defect
+  # is which cells the SECOND draw fails to reach. These replay the whole byte
+  # stream through a terminal and assert on the screen the user ends up looking
+  # at, which is where the two reported symptoms live:
+  #
+  #   * a surviving "jh" plus a level-two "h" reading as "hh"
+  #   * every marker of an eliminated branch still sitting on screen
+  describe 'redrawing between marker levels' do
+    # Enough of a terminal to place the marker sequences this file emits: absolute
+    # positioning, erase-in-display, erase-in-line, and SGR / alternate-screen
+    # sequences that only affect appearance. Every fixture is ASCII, so one
+    # character is one cell.
+    class TinyTerm
+      def initialize(width = 80, height = 24)
+        @w = width
+        @h = height
+        @rows = Array.new(height) { Array.new(width, ' ') }
+        @y = 0
+        @x = 0
+      end
+
+      def rows
+        @rows.map { |row| row.join.rstrip }
+      end
+
+      def feed(bytes)
+        i = 0
+        while i < bytes.length
+          char = bytes[i]
+          if char == "\e"
+            match = /\A\e\[([0-9;?]*)([A-Za-z])/.match(bytes[i..])
+            raise "unhandled escape: #{bytes[i, 12].inspect}" if match.nil?
+
+            csi match[1], match[2]
+            i += match[0].length
+            next
+          end
+
+          case char
+          when "\n" then @y += 1
+          when "\r" then @x = 0
+          else
+            @rows[@y][@x] = char if @y < @h && @x < @w
+            @x += 1
+          end
+          i += 1
+        end
+        self
+      end
+
+      private
+
+      def csi(params, final)
+        case final
+        when 'H'
+          row, column = params.split(';')
+          @y = [row.to_i, 1].max - 1
+          @x = [column.to_i, 1].max - 1
+        when 'J'
+          raise "unhandled ED #{params}" unless params == '2'
+
+          @rows = Array.new(@h) { Array.new(@w, ' ') }
+        when 'K'
+          (@x...@w).each { |x| @rows[@y][x] = ' ' } if @y < @h
+        when 'm', 'h', 'l' then nil # colours and the alternate-screen switch
+        else raise "unhandled CSI #{params}#{final}"
+        end
+      end
+    end
+
+    # `a` at the start of rows of deliberately different lengths. The one-character
+    # row is the whole point: a two-cell marker overhangs its end, and no repaint
+    # of the captured screen can overwrite a cell the capture does not contain.
+    let(:ragged_screen) do
+      %w[a ab abc abcd abcde a1 a2 a3 a4 a5 a6].join("\n")
+    end
+
+    let(:ragged_positions) do
+      positions = []
+      index = -1
+      positions << index while (index = ragged_screen.index('a', index + 1))
+      positions
+    end
+
+    # The draw path appends to Config.pane_tty_file. Point it at a regular file so
+    # the bytes can be replayed; the pty the outer `before` installs is drained and
+    # discarded, which is fine for every other spec but unreadable here.
+    def screen_after(positions, screen_chars, chars)
+      path = File.join(ENV['TMPDIR'] || '/tmp', "tmux-jump-spec-draw-#{Process.pid}")
+      File.write path, ''
+      Config.pane_tty_file = path
+      queue = chars.dup
+      allow_any_instance_of(Object).to receive(:prompt_char!) { queue.shift }
+
+      index = prompt_position_index! positions, screen_chars
+      [index, TinyTerm.new.feed(File.read(path)).rows]
+    ensure
+      File.delete path if path && File.exist?(path)
+    end
+
+    before do
+      # More positions than there are keys, so level one is two characters wide.
+      expect(ragged_positions.size).to be > KEYS.size
+      expect(keys_for(ragged_positions.size).first.size).to eq 2
+      @saved = [Config.alternate_on, Config.saved_screen]
+    end
+
+    # Config is process-global, so a leaked alternate_on would silently change
+    # which draw path every later example takes.
+    after { Config.alternate_on, Config.saved_screen = @saved }
+
+    context 'on a normal screen, where we own a fresh alternate screen' do
+      before { Config.alternate_on = '0' }
+
+      it 'leaves no marker cell outside the captured text' do
+        # 'j' takes the first nine positions, 'g' is KEYS[3] within them.
+        index, rows = screen_after ragged_positions, ragged_screen, %w[j g]
+        expect(index).to eq 3
+        expect(rows[0]).to eq 'j' # was "jj": level one's second cell survived
+        expect(rows[1]).to eq 'fb'
+        expect(rows[3]).to eq 'gbcd'
+      end
+    end
+
+    context 'on an alternate screen, where a full-screen program owns the pane' do
+      before do
+        Config.alternate_on = '1'
+        # What recover_alternate_screen_after captures before the first draw.
+        Config.saved_screen = ragged_screen.gsub("\n", "\n\r")
+      end
+
+      it 'erases the previous level instead of overlaying on top of it' do
+        index, rows = screen_after ragged_positions, ragged_screen, %w[j g]
+        expect(index).to eq 3
+        expect(rows[0]).to eq 'j'  # was "jj"
+        expect(rows[1]).to eq 'fb' # was "ff"
+        expect(rows[9]).to eq 'a5' # was "fj": an eliminated branch's marker
+        expect(rows[10]).to eq 'a6'
+      end
+
+      it 'falls back to the plain capture when no coloured one was taken' do
+        Config.saved_screen = nil
+        _index, rows = screen_after ragged_positions, ragged_screen, %w[j g]
+        expect(rows[9]).to eq 'a5'
+      end
+    end
+
+    it 'draws nothing at all when the match is unique' do
+      Config.alternate_on = '0'
+      path = File.join(ENV['TMPDIR'] || '/tmp', "tmux-jump-spec-unique-#{Process.pid}")
+      File.write path, ''
+      Config.pane_tty_file = path
+      expect(prompt_position_index!([3], ragged_screen)).to eq 0
+      expect(File.read(path)).to eq ''
+    ensure
+      File.delete path if File.exist?(path)
     end
   end
 
@@ -463,6 +711,25 @@ RSpec.describe 'tmux-jump' do
       ms = elapsed_ms { 10.times { marker_sequences(big_screen, positions, keys, keys.first.size) } } / 10
       expect(positions.size).to be > 400
       expect(ms).to be < 5.0
+    end
+
+    # The fixtures above are pure ASCII, where column resolution never looks at a
+    # character at all. That hid a quadratic path: one multi-byte glyph per row --
+    # a nerd-font `ls` listing, or any TUI -- made every marker rescan its line
+    # from the start, and the same screen went from 1.4ms to 36ms per draw.
+    it 'does not rescan a row once per marker on it' do
+      # \u{F07B} is a nerd-font folder icon, written as an escape so it cannot be
+      # silently lost in transit and quietly turn this back into an ASCII fixture.
+      glyph_screen = (1..60).map { |i| "\u{F07B} row-#{i}-#{'abcdefghij' * 18}a" }.join("\n")
+      positions = []
+      i = -1
+      positions << i while (i = glyph_screen.index('a', i + 1))
+      keys = keys_for positions.size
+      Config.keys_position = 'left'
+
+      expect(positions.size).to be > 1000
+      ms = elapsed_ms { 10.times { marker_sequences(glyph_screen, positions, keys, keys.first.size) } } / 10
+      expect(ms).to be < 20.0
     end
 
     it 'does not iterate the screen per character' do
