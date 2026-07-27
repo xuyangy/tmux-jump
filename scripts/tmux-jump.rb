@@ -55,6 +55,8 @@ Config = Struct.new(
   :alternate_on,
   :scroll_position,
   :pane_height,
+  :history_size,
+  :line_numbers,
   # Added for performance
   :gray,
   :red,
@@ -122,6 +124,7 @@ STARTUP_FIELDS = %w[
   scroll_position pane_height
   @jump-bg-color @jump-fg-color @jump-keys-position
   @jump-mode-single @jump-mode-double
+  history_size copy-mode-line-numbers
 ].freeze
 
 # tmux format-expands capture-pane's -S/-E, which is what lets the geometry, the
@@ -164,6 +167,8 @@ def read_startup_state!
   Config.pane_height = fields[6].to_i
 
   apply_option_defaults!(fields[7], fields[8], fields[9], fields[10], fields[11])
+  Config.history_size = fields[12].to_i
+  Config.line_numbers = fields[13]
 
   # capture-pane ends with a newline; drop it, not a trailing blank screen row.
   screen = screen.to_s
@@ -707,25 +712,95 @@ end
 
 def jump_to_index!(index, screen_chars)
   row, offset = row_and_offset_of index, screen_chars
-  pane = Config.pane_nr
+  tmux!(*jump_argv(row, offset, screen_chars))
+end
 
-  # No `start-of-line` here: it resolves to the start of the *logical* line,
-  # walking up through GRID_LINE_WRAPPED rows. When the top visible row is a
-  # wrap continuation (any long command or log line) that scrolls the view above
-  # row 0 of `screen_chars` and the row count below is applied from the wrong
-  # origin. `top-line` already leaves the cursor at row 0, column 0, and
-  # `cursor-up` preserves column 0, so it is redundant as well as harmful.
-  argv = ['copy-mode', '-t', pane, ';', 'send-keys', '-X', '-t', pane, 'top-line']
+# STICKY END-OF-LINE -- the reason this is not just top-line + cursor-down.
+#
+# Every vertical step in copy mode restores a remembered column (`lastcx`), and
+# window_copy only updates that memory while the cursor is NOT at the end of its
+# line. On a row with no text column 0 IS the end of the line, and a fresh copy
+# mode starts with the memory zeroed, so until the cursor has left a row with
+# text on it every step re-snaps to the end of whatever row it lands on. The
+# `cursor-right` that follows then wraps onto the row below, which is what puts
+# the cursor a row down and a column left of the marker the user pressed.
+#
+# A blank first row is not exotic: any full-screen program that pads its frame
+# has one, and that is exactly when this bites.
+#
+# Two ways out, both verified against a live tmux 3.7b under `mode-keys vi` and
+# `mode-keys emacs`, on blank-top-row, wrapped-line and scrolled-back screens:
+#
+#   * Start from a row that has text on it. `top-line` / `bottom-line` set the
+#     cursor outright rather than stepping, so they never snap, and the first
+#     step away from a row with text primes the memory correctly for the whole
+#     trip -- blank rows crossed later are then harmless. Costs nothing.
+#   * Hold the column in a rectangle selection, which suppresses the snap the
+#     way vim's visual block preserves a column. Correct anywhere, but each step
+#     redraws the selection: ~1ms per row on a 218-column pane, so it is the
+#     fallback rather than the rule.
+#
+# Resetting the column after the fact is NOT an option: `start-of-line`, and
+# `back-to-indentation` which calls it internally, both resolve to the start of
+# the *logical* line and walk up through GRID_LINE_WRAPPED rows, so on a wrapped
+# row -- any long command or log line -- they land above the target row.
 
-  # `screen_chars` was captured `scroll_position` rows above the view that
-  # copy-mode opens on, so walk UP into the history to reach its first row.
-  if Config.scroll_position > 0
-    argv.concat [';', 'send-keys', '-X', '-t', pane, '-N', Config.scroll_position.to_s, 'cursor-up']
+# The copy-mode command chain that lands the cursor on (row, offset) of
+# `screen_chars`. One chain, one round-trip; kept pure so spec/ can assert the
+# exact command sequence without a live server.
+def jump_argv(row, offset, screen_chars,
+              pane = Config.pane_nr,
+              scroll = Config.scroll_position.to_i,
+              height = Config.pane_height.to_i,
+              history_size = Config.history_size.to_i,
+              line_numbers = Config.line_numbers)
+  send_x = [';', 'send-keys', '-X', '-t', pane]
+  starts = line_starts_of screen_chars
+
+  # copy-mode opens on the live view. When the capture came from scrollback,
+  # `goto-line scroll` moves straight to its first row; walking there with
+  # `cursor-up` would redraw once per history row and make deep jumps needlessly
+  # slow. The bottom anchor is in the capture only when the pane is not scrolled.
+  bottom = height - 1
+
+  if !blank_row?(screen_chars, starts, 0)
+    from_top, guard = true, false
+  elsif scroll.zero? && height > 0 && !blank_row?(screen_chars, starts, bottom)
+    from_top, guard = false, false
+  else
+    from_top, guard = true, true
   end
-  argv.concat [';', 'send-keys', '-X', '-t', pane, '-N', row.to_s, 'cursor-down'] if row > 0
-  argv.concat [';', 'send-keys', '-X', '-t', pane, '-N', offset.to_s, 'cursor-right'] if offset > 0
 
-  tmux!(*argv)
+  up = from_top ? 0 : bottom - row
+  down = from_top ? row : 0
+  guard &&= up + down > 0
+
+  argv = ['copy-mode', '-t', pane, *send_x, from_top ? 'top-line' : 'bottom-line']
+  if from_top && scroll > 0
+    # absolute/relative/hybrid all make goto-line count from the oldest history
+    # line; off/default use the distance from the live view.
+    absolute = %w[absolute relative hybrid].include?(line_numbers)
+    line = absolute ? history_size - scroll + 1 : scroll
+    argv.concat [*send_x, 'goto-line', line.to_s]
+  end
+  argv.concat [*send_x, 'begin-selection', *send_x, 'rectangle-toggle'] if guard
+  argv.concat [*send_x, '-N', up.to_s, 'cursor-up'] if up > 0
+  argv.concat [*send_x, '-N', down.to_s, 'cursor-down'] if down > 0
+  argv.concat [*send_x, 'rectangle-toggle', *send_x, 'clear-selection'] if guard
+  argv.concat [*send_x, '-N', offset.to_s, 'cursor-right'] if offset > 0
+  argv
+end
+
+# Whether copy-mode sees no text on `row`, i.e. whether its column 0 is also its
+# end of line. capture-pane without `-e` gives us plain text, and both empty and
+# spaces-only rows have zero text width to copy-mode. The range check is
+# defensive for a short or malformed capture.
+def blank_row?(screen_chars, starts, row)
+  return true if row.negative? || row >= starts.size
+
+  start = starts[row]
+  finish = screen_chars.index("\n", start) || screen_chars.length
+  screen_chars[start...finish].lstrip.empty?
 end
 
 if $PROGRAM_NAME == __FILE__

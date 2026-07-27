@@ -142,6 +142,160 @@ RSpec.describe 'tmux-jump' do
     end
   end
 
+  # The chain that actually moves the cursor. Asserted literally because every
+  # part of it is load bearing and none of it is observable from Ruby: each
+  # variant below was verified against a live tmux 3.7b, under both `mode-keys
+  # vi` and `mode-keys emacs`, on blank-top-row, wrapped-line and scrolled-back
+  # screens. See the sticky end-of-line note above jump_argv.
+  describe '#jump_argv' do
+    def sends(argv)
+      argv.slice_before(';').map { |cmd| cmd.reject { |a| a == ';' } }
+    end
+
+    # 4 rows: the first has text, the last is blank.
+    let(:text_top) { "line one\nline two\n\nline four\n" }
+    # 4 rows: the first is blank (a padded full-screen frame), the last has text.
+    let(:blank_top) { "\nline two\n\nline four" }
+    # Blank at both ends, so neither anchor is usable.
+    let(:blank_ends) { "   \nline two\n\n   " }
+
+    it 'walks down from the top row when that row has text on it' do
+      expect(sends(jump_argv(2, 7, text_top, '%9', 0, 4))).to eq [
+        %w[copy-mode -t %9],
+        %w[send-keys -X -t %9 top-line],
+        %w[send-keys -X -t %9 -N 2 cursor-down],
+        %w[send-keys -X -t %9 -N 7 cursor-right]
+      ]
+    end
+
+    it 'emits nothing beyond top-line for the origin' do
+      expect(sends(jump_argv(0, 0, text_top, '%9', 0, 4))).to eq [
+        %w[copy-mode -t %9],
+        %w[send-keys -X -t %9 top-line]
+      ]
+    end
+
+    it 'skips the vertical move entirely on the first row' do
+      expect(sends(jump_argv(0, 7, text_top, '%9', 0, 4))).to eq [
+        %w[copy-mode -t %9],
+        %w[send-keys -X -t %9 top-line],
+        %w[send-keys -X -t %9 -N 7 cursor-right]
+      ]
+    end
+
+    # Starting from the blank first row is what snaps the cursor to the end of
+    # the line; the last row has text, so come up from there instead.
+    it 'walks up from the bottom row when the top row is blank' do
+      expect(sends(jump_argv(1, 7, blank_top, '%9', 0, 4))).to eq [
+        %w[copy-mode -t %9],
+        %w[send-keys -X -t %9 bottom-line],
+        %w[send-keys -X -t %9 -N 2 cursor-up],
+        %w[send-keys -X -t %9 -N 7 cursor-right]
+      ]
+    end
+
+    it 'uses pane height as the authoritative bottom-line coordinate' do
+      # Even if a supplied capture is shorter, bottom-line is still row 5 of
+      # this 6-row pane and must not be mistaken for capture row 3.
+      expect(jump_argv(1, 0, blank_top, '%9', 0, 6)).to include 'top-line'
+    end
+
+    it 'falls back to a rectangle selection when both ends are blank' do
+      expect(sends(jump_argv(1, 7, blank_ends, '%9', 0, 4))).to eq [
+        %w[copy-mode -t %9],
+        %w[send-keys -X -t %9 top-line],
+        %w[send-keys -X -t %9 begin-selection],
+        %w[send-keys -X -t %9 rectangle-toggle],
+        %w[send-keys -X -t %9 -N 1 cursor-down],
+        %w[send-keys -X -t %9 rectangle-toggle],
+        %w[send-keys -X -t %9 clear-selection],
+        %w[send-keys -X -t %9 -N 7 cursor-right]
+      ]
+    end
+
+    # goto-line moves directly from the live view to the capture's first row,
+    # so the work does not grow with the scrollback depth.
+    it 'jumps directly into history before descending on a scrolled pane' do
+      expect(sends(jump_argv(2, 3, text_top, '%9', 1, 4))).to eq [
+        %w[copy-mode -t %9],
+        %w[send-keys -X -t %9 top-line],
+        %w[send-keys -X -t %9 goto-line 1],
+        %w[send-keys -X -t %9 -N 2 cursor-down],
+        %w[send-keys -X -t %9 -N 3 cursor-right]
+      ]
+    end
+
+    it 'does not confuse deep scrollback with an out-of-range capture row' do
+      argv = jump_argv(2, 3, text_top, '%9', 274, 4)
+      expect(sends(argv)).to eq [
+        %w[copy-mode -t %9],
+        %w[send-keys -X -t %9 top-line],
+        %w[send-keys -X -t %9 goto-line 274],
+        %w[send-keys -X -t %9 -N 2 cursor-down],
+        %w[send-keys -X -t %9 -N 3 cursor-right]
+      ]
+      expect(argv).to_not include 'rectangle-toggle'
+    end
+
+    %w[absolute relative hybrid].each do |line_numbers|
+      it "uses absolute goto-line numbering in #{line_numbers} line-number mode" do
+        argv = jump_argv(2, 3, text_top, '%9', 139, 4, 300, line_numbers)
+        expect(sends(argv)).to include(
+          %w[send-keys -X -t %9 goto-line 162]
+        )
+      end
+    end
+
+    # goto-line itself sets the cursor outright. Only the descent from a
+    # genuinely blank captured top row needs the rectangle guard.
+    it 'guards the descent when a scrolled capture starts on a blank row' do
+      expect(sends(jump_argv(1, 3, blank_top, '%9', 2, 4))).to eq [
+        %w[copy-mode -t %9],
+        %w[send-keys -X -t %9 top-line],
+        %w[send-keys -X -t %9 goto-line 2],
+        %w[send-keys -X -t %9 begin-selection],
+        %w[send-keys -X -t %9 rectangle-toggle],
+        %w[send-keys -X -t %9 -N 1 cursor-down],
+        %w[send-keys -X -t %9 rectangle-toggle],
+        %w[send-keys -X -t %9 clear-selection],
+        %w[send-keys -X -t %9 -N 3 cursor-right]
+      ]
+    end
+
+    it 'unwinds the fallback before the horizontal move' do
+      argv = jump_argv(1, 7, blank_ends, '%9', 0, 4)
+      expect(argv.count('rectangle-toggle')).to eq 2 # on, then back off
+      expect(argv.last(3)).to eq %w[-N 7 cursor-right]
+      expect(argv.index('clear-selection')).to be < argv.index('cursor-right')
+    end
+
+    it 'stays within one tmux invocation' do
+      expect(jump_argv(2, 7, blank_ends, '%9', 1, 4).count('copy-mode')).to eq 1
+    end
+  end
+
+  describe '#blank_row?' do
+    let(:screen) { "  text\n   \n\nmore" }
+    let(:starts) { line_starts_of(screen) }
+
+    it 'is false for a row with text on it' do
+      expect(blank_row?(screen, starts, 0)).to eq false
+      expect(blank_row?(screen, starts, 3)).to eq false
+    end
+
+    it 'is true for a row of spaces, which copy-mode measures as empty' do
+      expect(blank_row?(screen, starts, 1)).to eq true
+    end
+
+    it 'is true for an empty row' do
+      expect(blank_row?(screen, starts, 2)).to eq true
+    end
+
+    it 'defensively treats rows past a short capture as blank' do
+      expect(blank_row?(screen, starts, 9)).to eq true
+    end
+  end
+
   describe '#char_width' do
     it 'reports zero width for marks tmux packs into the preceding cell' do
       expect(char_width("\u0301")).to eq 0  # combining acute
