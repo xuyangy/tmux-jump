@@ -90,6 +90,17 @@ tmux source-file ~/.tmux.conf
 
 tmux-jump can also be used in in any program and during copy mode.
 
+### Selecting to the end of the line
+
+Hold <kbd>Shift</kbd> while typing a marker key to select text instead of only
+moving the cursor: the selection runs from the marker to the last character of
+its line. When a marker has two keys, <kbd>Shift</kbd> on either one is enough.
+The selection is an ordinary copy-mode selection, so the usual copy key
+finishes it.
+
+A search character that matches exactly once jumps at once, without a marker,
+so there is no key to hold <kbd>Shift</kbd> on.
+
 ### Cancelling a jump
 
 A jump can be aborted at any prompt. One press is always enough — the pane is

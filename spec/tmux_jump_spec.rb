@@ -159,6 +159,22 @@ RSpec.describe 'tmux-jump' do
     # Blank at both ends, so neither anchor is usable.
     let(:blank_ends) { "   \nline two\n\n   " }
 
+    it 'selects from the landing cell to the end of the line when asked to' do
+      argv = jump_argv(2, 7, text_top, '%9', 0, 4, 0, '', true)
+      expect(sends(argv).last(3)).to eq [
+        %w[send-keys -X -t %9 -N 7 cursor-right],
+        %w[send-keys -X -t %9 begin-selection],
+        %w[send-keys -X -t %9 end-of-line]
+      ]
+    end
+
+    it 'starts the selection only after the sticky end-of-line guard is closed' do
+      argv = jump_argv(1, 7, blank_ends, '%9', 0, 4, 0, '', true)
+      expect(sends(argv).last(4).map(&:last)).to eq %w[
+        clear-selection cursor-right begin-selection end-of-line
+      ]
+    end
+
     it 'walks down from the top row when that row has text on it' do
       expect(sends(jump_argv(2, 7, text_top, '%9', 0, 4))).to eq [
         %w[copy-mode -t %9],
@@ -443,6 +459,31 @@ RSpec.describe 'tmux-jump' do
 
       it 'just returns nil' do
         expect(prompt_position_index!([3, 22, 59], simple_screen)).to eq nil
+      end
+    end
+
+    context 'when the marker key is typed with Shift held' do
+      before do
+        Config.select_to_eol = nil
+        allow_any_instance_of(Object).to receive(:prompt_char!).and_return 'F'
+      end
+      after { Config.select_to_eol = nil }
+
+      it 'picks the same marker and asks for a selection to the end of the line' do
+        expect(prompt_position_index!([3, 22, 59], simple_screen)).to eq 1
+        expect(Config.select_to_eol).to eq true
+      end
+    end
+
+    context 'when the marker key is typed without Shift' do
+      before do
+        Config.select_to_eol = nil
+        allow_any_instance_of(Object).to receive(:prompt_char!).and_return 'f'
+      end
+
+      it 'does not ask for a selection' do
+        expect(prompt_position_index!([3, 22, 59], simple_screen)).to eq 1
+        expect(Config.select_to_eol).to be_nil
       end
     end
 

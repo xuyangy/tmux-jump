@@ -78,7 +78,10 @@ Config = Struct.new(
   :prompt_file,
   :cancel_file,
   :arg_first,
-  :arg_second
+  :arg_second,
+  # True once a marker key was typed with Shift held: the jump then selects
+  # from the marker to the end of its line instead of only moving the cursor.
+  :select_to_eol
 ).new
 
 # Args: mode then optional pre-read chars (from tmux command-prompt).
@@ -706,6 +709,14 @@ def keys_for(position_count, keys = KEYS)
   end
 end
 
+# The index of the marker key that `char` is the Shift form of, or nil. An exact
+# match in KEYS is tried first by the caller, so a JUMP_KEYS set that itself
+# contains upper-case keys keeps them as plain marker keys.
+def shifted_key_index(char)
+  plain = char.downcase
+  plain == char ? nil : KEYS.index(plain)
+end
+
 # `redraw` is true for every level after the first, i.e. exactly when markers
 # from the previous level are still on the screen and have to be erased.
 def prompt_position_index!(positions, screen_chars, redraw = false)
@@ -719,6 +730,9 @@ def prompt_position_index!(positions, screen_chars, redraw = false)
    return nil if char.nil? # Handle cancellation
 
    key_index = KEYS.index(char)
+   if key_index.nil? && (key_index = shifted_key_index(char))
+     Config.select_to_eol = true
+   end
 
   if !key_index.nil? && key_len > 1
     magnitude = KEYS.size ** (key_len - 1)
@@ -888,7 +902,8 @@ def jump_argv(row, offset, screen_chars,
               scroll = Config.scroll_position.to_i,
               height = Config.pane_height.to_i,
               history_size = Config.history_size.to_i,
-              line_numbers = Config.line_numbers)
+              line_numbers = Config.line_numbers,
+              select_to_eol = Config.select_to_eol)
   send_x = [';', 'send-keys', '-X', '-t', pane]
   starts = line_starts_of screen_chars
 
@@ -923,6 +938,8 @@ def jump_argv(row, offset, screen_chars,
   argv.concat [*send_x, '-N', down.to_s, 'cursor-down'] if down > 0
   argv.concat [*send_x, 'rectangle-toggle', *send_x, 'clear-selection'] if guard
   argv.concat [*send_x, '-N', offset.to_s, 'cursor-right'] if offset > 0
+  # Appended to the same chain, so a selecting jump costs no extra round-trip.
+  argv.concat [*send_x, 'begin-selection', *send_x, 'end-of-line'] if select_to_eol
   argv
 end
 
