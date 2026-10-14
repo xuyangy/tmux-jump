@@ -351,14 +351,29 @@ def prompt_fifo_path!
   path
 end
 
+# The command a prompt runs with the pressed key: park it in a named buffer and
+# save that buffer straight into the FIFO.
+#
+# NO SHELL BETWEEN THE KEY AND THE FIFO. A `run-shell "printf ..."` template
+# would paste the key into shell source, where every key the shell treats
+# specially -- ' " \ % among them -- breaks the command and the keypress is
+# lost without a trace, so those characters could never be searched for.
+# `%%%` is the response with its
+# quotation marks escaped for the double-quoted argument it sits in, and
+# set-buffer / save-buffer take the bytes as they are. Skipping /bin/sh also
+# removes a fork from the keypress path.
+#
+# The buffer is named, so it never becomes the buffer a plain paste-buffer
+# picks, and it is deleted in the same chain.
+def prompt_template(path, buffer = "tmux-jump-#{Process.pid}")
+  %(set-buffer -b #{buffer} -- "%%%" ; save-buffer -b #{buffer} '#{path}' ; delete-buffer -b #{buffer})
+end
+
 def prompt_char!(label = 'char:', ctrl_keys = nil)
   path = prompt_fifo_path!
   io = open_prompt_fifo path
   cancel_r, cancel_w = IO.pipe
-  pid = Kernel.spawn(
-    'tmux', 'command-prompt', '-1', '-p', label,
-    "run-shell \"printf '%1' > #{path}\""
-  )
+  pid = Kernel.spawn('tmux', 'command-prompt', '-1', '-p', label, prompt_template(path))
   watcher = Thread.new do
     Process.wait pid
     cancel_w.write 'x'

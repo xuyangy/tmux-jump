@@ -64,8 +64,13 @@ else
 fi
 
 # `tmux command-prompt` blocks until the prompt is answered.
+#
+# The key goes buffer -> FIFO with no shell in between, for the reason given
+# above prompt_template in tmux-jump.rb: a shell template loses ' " \ and
+# friends. Keep the two templates in step.
+prompt_buffer="tmux-jump-$$"
 tmux command-prompt -1 -p "$prompt_label" \
-  "run-shell 'printf %s \"%1\" > \"$prompt_file\"'"
+  "set-buffer -b $prompt_buffer -- \"%%%\" ; save-buffer -b $prompt_buffer '$prompt_file' ; delete-buffer -b $prompt_buffer"
 
 # Our prompt resolved. If nothing reached the worker it was cancelled, and this
 # lets it stop now rather than waiting out its timeout.

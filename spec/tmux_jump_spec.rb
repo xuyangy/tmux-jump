@@ -1,4 +1,6 @@
+require 'fileutils'
 require 'pty'
+require 'tmpdir'
 
 ENV['JUMP_BACKGROUND_COLOR'] = "\e[0m\e[32m"
 ENV['JUMP_FOREGROUND_COLOR'] = "\e[1m\e[31m"
@@ -750,6 +752,148 @@ RSpec.describe 'tmux-jump' do
       # which captures every line of history. The multiply form must not.
       expanded = capture('-S', CAPTURE_START, '-E', CAPTURE_END)
       expect(expanded.lines.size).to be < capture('-S', '-', '-E', '-').lines.size
+    end
+  end
+
+  # The prompt hands the pressed key to the FIFO through tmux alone. Each of
+  # these keys would be lost by a hand-off through a shell template, and
+  # searching for it would do nothing. Runs a private tmux server with a real client
+  # attached through a pty -- command-prompt needs one -- and points prompt_char!
+  # at it through $TMUX, so the user's own server is never touched.
+  describe 'prompt template' do
+    it 'parks the key in a named buffer and saves it to the FIFO without a shell' do
+      expect(prompt_template('/tmp/x.fifo', 'tmux-jump-1')).to eq(
+        %(set-buffer -b tmux-jump-1 -- "%%%" ; save-buffer -b tmux-jump-1 '/tmp/x.fifo' ; ) +
+        'delete-buffer -b tmux-jump-1'
+      )
+    end
+
+    # Every tmux call in here is pinned to a private server, and the setup
+    # fails closed: nothing points prompt_char! anywhere until the private
+    # socket is proven to exist. An empty socket path in $TMUX (",0,0") makes
+    # tmux fall back to the user's default server, so a guess here would open
+    # prompts on the user's own client.
+    context 'against a live tmux' do
+      def ready_timeout = 5
+
+      def private_tmux(*args)
+        IO.popen([@real_tmux, '-S', @socket_path, '-f', '/dev/null', *args], err: File::NULL, &:read)
+      end
+
+      def wait_until(what)
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + ready_timeout
+        until yield
+          raise "timed out waiting for #{what}" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+
+          sleep 0.02
+        end
+      end
+
+      def client_output
+        @client_mutex.synchronize { @client_out.dup }
+      end
+
+      # One server per example, under a name nothing else uses. Reusing a name
+      # lets new-session reach the previous example's server while it exits.
+      def start_private_server!
+        @real_tmux = ENV['PATH'].split(':').map { |d| File.join(d, 'tmux') }
+                                .find { |p| File.executable?(p) } or raise 'tmux not found'
+        @tmp = Dir.mktmpdir('tmux-jump-spec')
+        @socket_path = File.join(@tmp, 'socket')
+        ok = system(@real_tmux, '-S', @socket_path, '-f', '/dev/null',
+                    'new-session', '-d', '-s', 'p', '-x', '40', '-y', '6', 'cat',
+                    out: File::NULL, err: File::NULL)
+        raise 'private tmux server did not start' unless ok
+
+        reported = private_tmux('display-message', '-p', '#{socket_path}').strip
+        raise "private socket not confirmed (got #{reported.inspect})" unless
+          !reported.empty? && File.realpath(reported) == File.realpath(@socket_path)
+
+        # prompt_char! runs a bare `tmux`; this one on PATH can only reach the
+        # private socket, whatever $TMUX says.
+        bin = File.join(@tmp, 'bin')
+        Dir.mkdir(bin)
+        File.write(File.join(bin, 'tmux'), "#!/bin/sh\nexec '#{@real_tmux}' -S '#{@socket_path}' \"$@\"\n")
+        File.chmod(0o755, File.join(bin, 'tmux'))
+        @wrapper_bin = bin
+      end
+
+      def attach_client!
+        @client_out = String.new(encoding: Encoding::BINARY)
+        @client_mutex = Mutex.new
+        @client_r, @client_w, @client_pid = PTY.spawn(
+          { 'TERM' => 'xterm-256color' }, @real_tmux, '-S', @socket_path, 'attach', '-t', 'p'
+        )
+        @client_drain = Thread.new do
+          loop do
+            chunk = @client_r.readpartial(4096)
+            @client_mutex.synchronize { @client_out << chunk }
+          end
+        rescue StandardError
+          nil
+        end
+        wait_until('the client to attach') { !private_tmux('list-clients').strip.empty? }
+      end
+
+      around do |example|
+        saved = { 'TMUX' => ENV['TMUX'], 'PATH' => ENV['PATH'] }
+        saved_prompt_file = Config.prompt_file
+        start_private_server!
+        attach_client!
+        ENV['TMUX'] = "#{@socket_path},0,0"
+        ENV['PATH'] = "#{@wrapper_bin}:#{saved['PATH']}"
+        Config.prompt_file = nil
+        example.run
+      ensure
+        ENV['TMUX'] = saved['TMUX']
+        ENV['PATH'] = saved['PATH']
+        cleanup_prompt_file
+        Config.prompt_file = saved_prompt_file
+        private_tmux('kill-server') if @socket_path
+        @client_w&.close
+        @client_r&.close
+        if @client_pid
+          begin
+            Process.kill('TERM', @client_pid)
+          rescue Errno::ESRCH
+            nil
+          end
+          Process.wait(@client_pid)
+        end
+        @client_drain&.kill
+        FileUtils.rm_rf(@tmp) if @tmp
+      end
+
+      # A label no pane content contains, so seeing it on the client means the
+      # prompt itself is up and the key will reach it rather than the pane.
+      def prompt_label = 'tmux-jump-spec-key:'
+
+      def press(key, ctrl_keys = nil)
+        @client_mutex.synchronize { @client_out.clear }
+        typist = Thread.new do
+          wait_until('the prompt to open') { client_output.include?(prompt_label) }
+          @client_w.write key
+        end
+        typist.report_on_exception = false
+        prompt_char!(prompt_label, ctrl_keys)
+      ensure
+        typist&.join
+      end
+
+      ["'", '"', '\\', '%', '$', ';', '#', '~', '`', ' ', 'é'].each do |key|
+        it "delivers #{key.inspect} as itself" do
+          expect(press(key)).to eq key
+        end
+      end
+
+      it 'delivers a Ctrl marker byte the marker prompt accepts' do
+        expect(press("\n", CTRL_KEY_BYTES)).to eq "\n"
+      end
+
+      it 'leaves no buffer behind' do
+        expect(press('q')).to eq 'q'
+        expect(private_tmux('list-buffers')).to eq ''
+      end
     end
   end
 
