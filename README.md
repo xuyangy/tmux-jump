@@ -98,8 +98,21 @@ its line. When a marker has two keys, <kbd>Shift</kbd> on either one is enough.
 The selection is an ordinary copy-mode selection, so the usual copy key
 finishes it.
 
+### Pasting to the end of the line
+
+Hold <kbd>Ctrl</kbd> while typing a marker key to paste the text from the marker
+to the last character of its line. Like the `:paste:` action of
+[tmux-fingers](https://github.com/Morantron/tmux-fingers), the text goes into
+the pane the jump ran in, at the cursor of the program running there, and stays
+in the newest tmux paste buffer. When a marker has two keys, <kbd>Ctrl</kbd> on
+either one is enough.
+
+<kbd>Ctrl</kbd>+<kbd>I</kbd> and <kbd>Ctrl</kbd>+<kbd>M</kbd> send the same bytes
+as <kbd>Tab</kbd> and <kbd>Enter</kbd>, so they cancel instead. Keep `i` and `m`
+out of `JUMP_KEYS` if you want <kbd>Ctrl</kbd> on every marker key.
+
 A search character that matches exactly once jumps at once, without a marker,
-so there is no key to hold <kbd>Shift</kbd> on.
+so there is no key to hold <kbd>Shift</kbd> or <kbd>Ctrl</kbd> on.
 
 ### Cancelling a jump
 
@@ -112,13 +125,13 @@ left exactly as it was, and no further prompt appears.
 | <kbd>Enter</kbd> | Cancels |
 | <kbd>Tab</kbd> | Cancels |
 | <kbd>Backspace</kbd> | Cancels |
-| <kbd>Ctrl</kbd> + any key | Cancels — includes <kbd>Ctrl</kbd>+<kbd>C</kbd>, <kbd>Ctrl</kbd>+<kbd>G</kbd>, <kbd>Ctrl</kbd>+<kbd>D</kbd> |
+| <kbd>Ctrl</kbd> + any key | Cancels — includes <kbd>Ctrl</kbd>+<kbd>C</kbd>. At the marker prompt, <kbd>Ctrl</kbd> + a marker key pastes instead |
 | Arrow / function / <kbd>Home</kbd> / <kbd>End</kbd> / <kbd>PgUp</kbd> / <kbd>PgDn</kbd> | **Ignored** — the prompt stays open, waiting |
 | Any key that is not a marker key | Cancels, at the marker prompt only |
 | *(no key at all)* | Cancels after 10 seconds |
 
 The rule is that every control character cancels: bytes `0x01`–`0x1f` plus
-`0x7f`. Everything printable — `0x20`–`0x7e`, plus any UTF-8 character — is a
+`0x7f`. The one exception is <kbd>Ctrl</kbd> + a marker key at the marker prompt. Everything printable — `0x20`–`0x7e`, plus any UTF-8 character — is a
 jump target, so punctuation and <kbd>Space</kbd> are searchable and do not abort.
 
 Two notes on why the table looks the way it does:

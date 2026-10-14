@@ -79,9 +79,10 @@ Config = Struct.new(
   :cancel_file,
   :arg_first,
   :arg_second,
-  # True once a marker key was typed with Shift held: the jump then selects
-  # from the marker to the end of its line instead of only moving the cursor.
-  :select_to_eol
+  # What the jump does with the text from the marker to the end of its line:
+  # nil only moves the cursor, :select selects it (Shift + marker key) and
+  # :paste pastes it into the pane (Ctrl + marker key).
+  :line_action
 ).new
 
 # Args: mode then optional pre-read chars (from tmux command-prompt).
@@ -280,7 +281,11 @@ end
 
 # Block until `char_count` complete characters are available. No polling: the
 # only wait is IO.select, which wakes the moment tmux writes.
-def read_chars_from_fifo(io, char_count, timeout_seconds = PROMPT_TIMEOUT, cancel_io = nil)
+#
+# `ctrl_keys` lists control bytes that are answers rather than cancels. Only the
+# marker prompt passes any: Ctrl + a marker key arrives as that key's control
+# byte (C-f as 0x06), and the caller maps it back to the key.
+def read_chars_from_fifo(io, char_count, timeout_seconds = PROMPT_TIMEOUT, cancel_io = nil, ctrl_keys = nil)
   buf = String.new(encoding: Encoding::BINARY)
   watched = cancel_io ? [io, cancel_io] : [io]
   deadline_grace = nil
@@ -314,10 +319,15 @@ def read_chars_from_fifo(io, char_count, timeout_seconds = PROMPT_TIMEOUT, cance
     # char2: prompt on an aborted double jump.
     #
     # This line IS the cancel rule documented under "Cancelling a jump" in
-    # README.md. Keep the two in step: 0x01-0x1f and 0x7f abort, 0x20-0x7e and
-    # UTF-8 are jump targets.
+    # README.md. Keep the two in step: 0x01-0x1f and 0x7f abort, except the
+    # Ctrl form of a marker key at the marker prompt; 0x20-0x7e and UTF-8 are
+    # jump targets.
     first = buf.getbyte(0)
-    return nil if first && (first < 0x20 || first == 0x7f)
+    if first && (first < 0x20 || first == 0x7f)
+      return nil unless ctrl_keys&.include?(first.chr)
+
+      return first.chr
+    end
 
     text = buf.dup.force_encoding(Encoding::UTF_8)
     next unless text.valid_encoding? # partial multi-byte character
@@ -341,7 +351,7 @@ def prompt_fifo_path!
   path
 end
 
-def prompt_char!(label = 'char:')
+def prompt_char!(label = 'char:', ctrl_keys = nil)
   path = prompt_fifo_path!
   io = open_prompt_fifo path
   cancel_r, cancel_w = IO.pipe
@@ -356,7 +366,7 @@ def prompt_char!(label = 'char:')
     nil
   end
 
-  read_chars_from_fifo(io, 1, PROMPT_TIMEOUT, cancel_r)
+  read_chars_from_fifo(io, 1, PROMPT_TIMEOUT, cancel_r, ctrl_keys)
 ensure
   watcher.kill if watcher
   io.close if io
@@ -717,6 +727,17 @@ def shifted_key_index(char)
   plain == char ? nil : KEYS.index(plain)
 end
 
+# Ctrl + a letter reaches `command-prompt -1` as the letter's control byte, so
+# CTRL_KEYS[i] is the byte for Ctrl + KEYS[i], or nil when that key has no
+# usable Ctrl form. C-i and C-m are excluded: they are the same bytes as <Tab>
+# and <Enter>, which must keep cancelling.
+CTRL_KEYS = KEYS.map do |key|
+  next unless key.match?(/\A[a-zA-Z]\z/) && !'iImM'.include?(key)
+
+  (key.ord & 0x1f).chr
+end.freeze
+CTRL_KEY_BYTES = CTRL_KEYS.compact.join.freeze
+
 # `redraw` is true for every level after the first, i.e. exactly when markers
 # from the previous level are still on the screen and have to be erased.
 def prompt_position_index!(positions, screen_chars, redraw = false)
@@ -726,13 +747,16 @@ def prompt_position_index!(positions, screen_chars, redraw = false)
   keys = keys_for positions.size
   key_len = keys.first.size
   draw_keys_onto_tty screen_chars, positions, keys, key_len, redraw
-   char = prompt_char!
-   return nil if char.nil? # Handle cancellation
+  char = prompt_char!('char:', CTRL_KEY_BYTES)
+  return nil if char.nil? # Handle cancellation
 
-   key_index = KEYS.index(char)
-   if key_index.nil? && (key_index = shifted_key_index(char))
-     Config.select_to_eol = true
-   end
+  key_index = KEYS.index(char)
+  if key_index.nil? && (key_index = CTRL_KEYS.index(char))
+    Config.line_action = :paste
+  elsif key_index.nil? && (key_index = shifted_key_index(char))
+    # Paste already implies the text; a Shift on another level must not undo it.
+    Config.line_action ||= :select
+  end
 
   if !key_index.nil? && key_len > 1
     magnitude = KEYS.size ** (key_len - 1)
@@ -903,7 +927,7 @@ def jump_argv(row, offset, screen_chars,
               height = Config.pane_height.to_i,
               history_size = Config.history_size.to_i,
               line_numbers = Config.line_numbers,
-              select_to_eol = Config.select_to_eol)
+              line_action = Config.line_action)
   send_x = [';', 'send-keys', '-X', '-t', pane]
   starts = line_starts_of screen_chars
 
@@ -938,8 +962,12 @@ def jump_argv(row, offset, screen_chars,
   argv.concat [*send_x, '-N', down.to_s, 'cursor-down'] if down > 0
   argv.concat [*send_x, 'rectangle-toggle', *send_x, 'clear-selection'] if guard
   argv.concat [*send_x, '-N', offset.to_s, 'cursor-right'] if offset > 0
-  # Appended to the same chain, so a selecting jump costs no extra round-trip.
-  argv.concat [*send_x, 'begin-selection', *send_x, 'end-of-line'] if select_to_eol
+  # Appended to the same chain, so neither action costs an extra round-trip.
+  # Paste goes to the pane the jump ran in, the way tmux-fingers' :paste: does;
+  # copy-selection-and-cancel leaves copy mode first, so the text reaches the
+  # program in the pane rather than copy mode.
+  argv.concat [*send_x, 'begin-selection', *send_x, 'end-of-line'] if line_action
+  argv.concat [*send_x, 'copy-selection-and-cancel', ';', 'paste-buffer', '-t', pane] if line_action == :paste
   argv
 end
 

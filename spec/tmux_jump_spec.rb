@@ -160,7 +160,7 @@ RSpec.describe 'tmux-jump' do
     let(:blank_ends) { "   \nline two\n\n   " }
 
     it 'selects from the landing cell to the end of the line when asked to' do
-      argv = jump_argv(2, 7, text_top, '%9', 0, 4, 0, '', true)
+      argv = jump_argv(2, 7, text_top, '%9', 0, 4, 0, '', :select)
       expect(sends(argv).last(3)).to eq [
         %w[send-keys -X -t %9 -N 7 cursor-right],
         %w[send-keys -X -t %9 begin-selection],
@@ -168,8 +168,18 @@ RSpec.describe 'tmux-jump' do
       ]
     end
 
+    it 'copies the selection and pastes it into the pane when asked to paste' do
+      argv = jump_argv(2, 7, text_top, '%9', 0, 4, 0, '', :paste)
+      expect(sends(argv).last(4)).to eq [
+        %w[send-keys -X -t %9 begin-selection],
+        %w[send-keys -X -t %9 end-of-line],
+        %w[send-keys -X -t %9 copy-selection-and-cancel],
+        %w[paste-buffer -t %9]
+      ]
+    end
+
     it 'starts the selection only after the sticky end-of-line guard is closed' do
-      argv = jump_argv(1, 7, blank_ends, '%9', 0, 4, 0, '', true)
+      argv = jump_argv(1, 7, blank_ends, '%9', 0, 4, 0, '', :select)
       expect(sends(argv).last(4).map(&:last)).to eq %w[
         clear-selection cursor-right begin-selection end-of-line
       ]
@@ -464,26 +474,43 @@ RSpec.describe 'tmux-jump' do
 
     context 'when the marker key is typed with Shift held' do
       before do
-        Config.select_to_eol = nil
+        Config.line_action = nil
         allow_any_instance_of(Object).to receive(:prompt_char!).and_return 'F'
       end
-      after { Config.select_to_eol = nil }
+      after { Config.line_action = nil }
 
       it 'picks the same marker and asks for a selection to the end of the line' do
         expect(prompt_position_index!([3, 22, 59], simple_screen)).to eq 1
-        expect(Config.select_to_eol).to eq true
+        expect(Config.line_action).to eq :select
       end
+    end
+
+    context 'when the marker key is typed with Ctrl held' do
+      before do
+        Config.line_action = nil
+        allow_any_instance_of(Object).to receive(:prompt_char!).and_return "\x06"
+      end
+      after { Config.line_action = nil }
+
+      it 'picks the same marker and asks for a paste' do
+        expect(prompt_position_index!([3, 22, 59], simple_screen)).to eq 1
+        expect(Config.line_action).to eq :paste
+      end
+    end
+
+    it 'gives every default marker key a Ctrl form' do
+      expect(CTRL_KEYS).to eq "\n\x06\b\a\v\x04\f\x13\x01".chars
     end
 
     context 'when the marker key is typed without Shift' do
       before do
-        Config.select_to_eol = nil
+        Config.line_action = nil
         allow_any_instance_of(Object).to receive(:prompt_char!).and_return 'f'
       end
 
       it 'does not ask for a selection' do
         expect(prompt_position_index!([3, 22, 59], simple_screen)).to eq 1
-        expect(Config.select_to_eol).to be_nil
+        expect(Config.line_action).to be_nil
       end
     end
 
@@ -852,6 +879,24 @@ RSpec.describe 'tmux-jump' do
         expect(read_chars_from_fifo(@io, 1, 5)).to eq nil
         t.join
       end
+    end
+
+    it 'accepts a control byte the marker prompt lists as a Ctrl marker key' do
+      t = Thread.new do
+        sleep 0.03
+        File.open(@path, 'wb') { |f| f.write "\x06" }
+      end
+      expect(read_chars_from_fifo(@io, 1, 5, nil, "\x06")).to eq "\x06"
+      t.join
+    end
+
+    it 'still cancels on a control byte the marker prompt does not list' do
+      t = Thread.new do
+        sleep 0.03
+        File.open(@path, 'wb') { |f| f.write "\x03" }
+      end
+      expect(read_chars_from_fifo(@io, 1, 5, nil, "\x06")).to eq nil
+      t.join
     end
 
     it 'still accepts ordinary jump targets' do
