@@ -826,11 +826,11 @@ RSpec.describe 'tmux-jump' do
     end
 
     # Every tmux call in here is pinned to a private server, and the setup
-    # fails closed: nothing points prompt_char! anywhere until the private
-    # socket is proven to exist. An empty socket path in $TMUX (",0,0") makes
-    # tmux fall back to the user's default server, so a guess here would open
+    # fails closed: nothing points a prompt anywhere until the private socket
+    # is proven to exist. An empty socket path in $TMUX (",0,0") makes tmux
+    # fall back to the user's default server, so a guess here would open
     # prompts on the user's own client.
-    context 'against a live tmux' do
+    shared_context 'a guarded private tmux' do
       def ready_timeout = 5
 
       def private_tmux(*args)
@@ -866,8 +866,8 @@ RSpec.describe 'tmux-jump' do
         raise "private socket not confirmed (got #{reported.inspect})" unless
           !reported.empty? && File.realpath(reported) == File.realpath(@socket_path)
 
-        # prompt_char! runs a bare `tmux`; this one on PATH can only reach the
-        # private socket, whatever $TMUX says.
+        # prompt_char! and the launcher run a bare `tmux`; this one on PATH can
+        # only reach the private socket, whatever $TMUX says.
         bin = File.join(@tmp, 'bin')
         Dir.mkdir(bin)
         File.write(File.join(bin, 'tmux'), "#!/bin/sh\nexec '#{@real_tmux}' -S '#{@socket_path}' \"$@\"\n")
@@ -921,23 +921,39 @@ RSpec.describe 'tmux-jump' do
         FileUtils.rm_rf(@tmp) if @tmp
       end
 
-      # A label no pane content contains, so seeing it on the client means the
-      # prompt itself is up and the key will reach it rather than the pane.
+      # Types `key` once `label` is on the client, i.e. once the prompt itself
+      # is up and the key will reach it rather than the pane. The caller clears
+      # the client output before opening the prompt, so an old label cannot
+      # count.
+      def type_when_prompt_shows(label, key)
+        typist = Thread.new do
+          wait_until('the prompt to open') { client_output.include?(label) }
+          @client_w.write key
+        end
+        typist.report_on_exception = false
+        typist
+      end
+    end
+
+    # Keys every prompt must hand over as themselves. The backtick is the
+    # clearest sign that no shell sits between the key and the FIFO.
+    prompt_keys = ["'", '"', '\\', '%', '$', ';', '#', '~', '`', ' ', 'é'].freeze
+
+    context 'against a live tmux' do
+      include_context 'a guarded private tmux'
+
+      # A label no pane content contains.
       def prompt_label = 'tmux-jump-spec-key:'
 
       def press(key, ctrl_keys = nil)
         @client_mutex.synchronize { @client_out.clear }
-        typist = Thread.new do
-          wait_until('the prompt to open') { client_output.include?(prompt_label) }
-          @client_w.write key
-        end
-        typist.report_on_exception = false
+        typist = type_when_prompt_shows(prompt_label, key)
         prompt_char!(prompt_label, ctrl_keys)
       ensure
         typist&.join
       end
 
-      ["'", '"', '\\', '%', '$', ';', '#', '~', '`', ' ', 'é'].each do |key|
+      prompt_keys.each do |key|
         it "delivers #{key.inspect} as itself" do
           expect(press(key)).to eq key
         end
@@ -950,6 +966,71 @@ RSpec.describe 'tmux-jump' do
       it 'leaves no buffer behind' do
         expect(press('q')).to eq 'q'
         expect(private_tmux('list-buffers')).to eq ''
+      end
+    end
+
+    # The launcher's own first-character prompt, run for real: scripts/
+    # tmux-jump.sh opens it on the private server and starts the worker. The
+    # worker is a stand-in that loads tmux-jump.rb and reads the FIFO with the
+    # real reader, then records the key instead of jumping, so the screen and
+    # copy mode are never involved.
+    context 'the launcher prompt against a live tmux' do
+      include_context 'a guarded private tmux'
+
+      def stand_in_ruby!
+        reader = File.join(@tmp, 'stand_in_worker.rb')
+        File.write(reader, <<~'WORKER')
+          load ARGV.shift # the real tmux-jump.rb; its main does not run when loaded
+          parse_argv! ARGV
+          io = open_prompt_fifo Config.prompt_file
+          cancel_io = open_prompt_fifo Config.cancel_file
+          key = read_chars_from_fifo(io, 1, PROMPT_TIMEOUT, cancel_io)
+          cleanup_prompt_file # before reporting, so the FIFOs are gone once the key is seen
+          out = ENV.fetch('TMUX_JUMP_SPEC_OUT')
+          File.binwrite("#{out}.part", key.inspect)
+          File.rename("#{out}.part", out)
+        WORKER
+        ruby = File.join(@tmp, 'ruby')
+        # The launcher passes --disable-gems first; the stand-in keeps it.
+        File.write(ruby, "#!/bin/bash\nexec '#{RbConfig.ruby}' \"$1\" '#{reader}' \"${@:2}\"\n")
+        File.chmod(0o755, ruby)
+        ruby
+      end
+
+      def launcher_press(key)
+        out = File.join(@tmp, 'worker-key')
+        @client_mutex.synchronize { @client_out.clear }
+        launcher = Process.spawn(
+          { 'TMPDIR' => @tmp, 'TMUX_JUMP_SPEC_OUT' => out },
+          'bash', File.expand_path('../scripts/tmux-jump.sh', __dir__), 'single', stand_in_ruby!,
+          out: File::NULL, err: File::NULL
+        )
+        type_when_prompt_shows('char:', key).join
+        wait_until('the launcher to finish') { Process.wait(launcher, Process::WNOHANG) }
+        launcher = nil
+        wait_until('the worker to record the key') { File.exist?(out) }
+        File.binread(out).force_encoding(Encoding::UTF_8)
+      ensure
+        if launcher
+          begin
+            Process.kill('TERM', launcher)
+          rescue Errno::ESRCH
+            nil
+          end
+          Process.wait(launcher)
+        end
+      end
+
+      prompt_keys.each do |key|
+        it "hands #{key.inspect} to the worker as itself" do
+          expect(launcher_press(key)).to eq key.inspect
+        end
+      end
+
+      it 'leaves no buffer and no FIFO behind' do
+        expect(launcher_press('q')).to eq 'q'.inspect
+        expect(private_tmux('list-buffers')).to eq ''
+        expect(Dir.children(@tmp).grep(/\Atmux-jump\./)).to eq []
       end
     end
   end
