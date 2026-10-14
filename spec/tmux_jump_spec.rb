@@ -981,6 +981,8 @@ RSpec.describe 'tmux-jump' do
         reader = File.join(@tmp, 'stand_in_worker.rb')
         File.write(reader, <<~'WORKER')
           load ARGV.shift # the real tmux-jump.rb; its main does not run when loaded
+          File.write("#{ENV.fetch('TMUX_JUMP_SPEC_OUT')}.pid", Process.pid)
+          sleep ENV.fetch('TMUX_JUMP_SPEC_WORKER_DELAY', '0').to_f # a slow interpreter start
           parse_argv! ARGV
           io = open_prompt_fifo Config.prompt_file
           cancel_io = open_prompt_fifo Config.cancel_file
@@ -997,27 +999,55 @@ RSpec.describe 'tmux-jump' do
         ruby
       end
 
-      def launcher_press(key)
+      # The launcher runs in a process group of its own, and a non-interactive
+      # bash leaves the worker it backgrounds in that group. So when an example
+      # fails midway, stopping the group stops the launcher, its prompt client
+      # and the stand-in worker together; nothing outlives the example.
+      def launcher_press(key, worker_delay: 0)
         out = File.join(@tmp, 'worker-key')
         @client_mutex.synchronize { @client_out.clear }
-        launcher = Process.spawn(
-          { 'TMPDIR' => @tmp, 'TMUX_JUMP_SPEC_OUT' => out },
+        finished = false
+        launcher = @launcher_pgid = Process.spawn(
+          { 'TMPDIR' => @tmp, 'TMUX_JUMP_SPEC_OUT' => out, 'TMUX_JUMP_SPEC_WORKER_DELAY' => worker_delay.to_s },
           'bash', File.expand_path('../scripts/tmux-jump.sh', __dir__), 'single', stand_in_ruby!,
-          out: File::NULL, err: File::NULL
+          out: File::NULL, err: File::NULL, pgroup: true
         )
         type_when_prompt_shows('char:', key).join
         wait_until('the launcher to finish') { Process.wait(launcher, Process::WNOHANG) }
         launcher = nil
         wait_until('the worker to record the key') { File.exist?(out) }
+        finished = true
         File.binread(out).force_encoding(Encoding::UTF_8)
       ensure
-        if launcher
-          begin
-            Process.kill('TERM', launcher)
-          rescue Errno::ESRCH
-            nil
+        stop_launcher_group(@launcher_pgid, launcher) unless finished
+      end
+
+      # macOS answers EPERM rather than ESRCH for a group whose members are all
+      # zombies waiting for launchd to reap them, which is gone for our purpose.
+      def launcher_group_gone?(pgid)
+        Process.kill(0, -pgid)
+        false
+      rescue Errno::ESRCH, Errno::EPERM
+        true
+      end
+
+      # `launcher` is the launcher's pid while it is still unreaped. It is reaped
+      # before the group is checked, since a zombie still counts as a member.
+      def stop_launcher_group(pgid, launcher)
+        signal = 'TERM'
+        begin
+          Process.kill(signal, -pgid)
+        rescue Errno::ESRCH
+          nil
+        end
+        Process.wait(launcher) if launcher
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + ready_timeout
+        until launcher_group_gone?(pgid)
+          if signal == 'TERM' && Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+            signal = 'KILL'
+            Process.kill(signal, -pgid) rescue nil
           end
-          Process.wait(launcher)
+          sleep 0.02
         end
       end
 
@@ -1025,6 +1055,33 @@ RSpec.describe 'tmux-jump' do
         it "hands #{key.inspect} to the worker as itself" do
           expect(launcher_press(key)).to eq key.inspect
         end
+      end
+
+      it 'keeps a key typed before the worker has opened the FIFO' do
+        expect(launcher_press('q', worker_delay: 0.5)).to eq 'q'.inspect
+      end
+
+      it 'stops the launcher and the worker when the key is never typed' do
+        worker_pid_file = File.join(@tmp, 'worker-key.pid')
+        # Fail only once the prompt is open and the worker is running, so there
+        # is something left to stop.
+        allow(self).to receive(:type_when_prompt_shows) do |label, _key|
+          wait_until('the prompt to open') { client_output.include?(label) }
+          wait_until('the worker to start') { File.exist?(worker_pid_file) }
+          raise 'simulated typing failure'
+        end
+        expect { launcher_press('q') }.to raise_error('simulated typing failure')
+        worker = File.read(worker_pid_file).to_i
+        expect(launcher_group_gone?(@launcher_pgid)).to be true
+        # Once launchd has reaped it, the worker pid no longer exists at all.
+        expect do
+          wait_until('the worker to be reaped') do
+            Process.kill(0, worker)
+            false
+          rescue Errno::ESRCH
+            true
+          end
+        end.not_to raise_error
       end
 
       it 'leaves no buffer and no FIFO behind' do

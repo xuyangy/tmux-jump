@@ -40,6 +40,11 @@ case "$fifo_dir" in
 esac
 prompt_file="$(mktemp -u "$fifo_dir/tmux-jump.XXXXXX")" || exit 1
 mkfifo "$prompt_file" || exit 1
+# Hold the FIFO open from here on, before the worker exists. save-buffer does
+# not wait for a reader: with none, the key is dropped. A key typed while ruby
+# is still starting would be lost. Opened read-write so this cannot block; the
+# worker inherits the descriptor, so the pipe keeps the key until it reads.
+exec 9<>"$prompt_file"
 
 # Separate channel so "the prompt chain finished" can never be confused with a
 # typed character. Opened read-write here so writing to it can never block, even
