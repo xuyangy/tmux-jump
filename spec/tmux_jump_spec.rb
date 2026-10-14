@@ -768,6 +768,63 @@ RSpec.describe 'tmux-jump' do
       )
     end
 
+    describe 'FIFO directory guard' do
+      it 'keeps an ordinary TMPDIR, spaces included' do
+        expect(prompt_fifo_dir('/var/folders/ab/xyz/T/')).to eq '/var/folders/ab/xyz/T/'
+        expect(prompt_fifo_dir('/tmp/plain dir')).to eq '/tmp/plain dir'
+      end
+
+      ["/tmp/it's", '/tmp/a#b', '/tmp/50%', "/tmp/a\tb", "/tmp/a\nb", "/tmp/a\x7fb"].each do |dir|
+        it "falls back to /tmp for #{dir.inspect}" do
+          expect(prompt_fifo_dir(dir)).to eq '/tmp'
+        end
+      end
+
+      it 'falls back to /tmp when TMPDIR is unset or empty' do
+        expect(prompt_fifo_dir(nil)).to eq '/tmp'
+        expect(prompt_fifo_dir('')).to eq '/tmp'
+      end
+
+      # The launcher's copy of the rule, run for real. tmux and ruby are both
+      # stand-ins that only record their arguments, so no tmux server is
+      # involved and the FIFO path the launcher chose can be read back.
+      context 'in the launcher' do
+        def launch(tmpdir)
+          Dir.mktmpdir('tmux-jump-launcher') do |stub|
+            log = File.join(stub, 'args')
+            %w[tmux worker].each do |name|
+              File.write(File.join(stub, name), "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '#{log}'\n")
+              File.chmod(0o755, File.join(stub, name))
+            end
+            env = { 'TMPDIR' => tmpdir, 'PATH' => "#{stub}:#{ENV['PATH']}" }
+            system(env, 'bash', File.expand_path('../scripts/tmux-jump.sh', __dir__),
+                   'single', File.join(stub, 'worker'), out: File::NULL, err: File::NULL)
+            # The worker is started in the background; give it a bounded moment.
+            deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+            sleep 0.02 until File.read(log).include?('--prompt-file') ||
+                             Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+            prompt_file = File.read(log)[/--prompt-file (\S+)/, 1]
+            [prompt_file, "#{prompt_file}.cancel"].each { |f| File.delete(f) if f && File.exist?(f) }
+            prompt_file
+          end
+        end
+
+        it 'creates the FIFO in an ordinary TMPDIR' do
+          Dir.mktmpdir('tmux-jump-safe') do |dir|
+            expect(launch(dir)).to start_with(File.join(dir, 'tmux-jump.'))
+          end
+        end
+
+        it "creates the FIFO in /tmp when TMPDIR holds a '" do
+          Dir.mktmpdir('tmux-jump-unsafe') do |base|
+            dir = File.join(base, "it's")
+            Dir.mkdir(dir)
+            expect(launch(dir)).to start_with('/tmp/tmux-jump.')
+          end
+        end
+      end
+    end
+
     # Every tmux call in here is pinned to a private server, and the setup
     # fails closed: nothing points prompt_char! anywhere until the private
     # socket is proven to exist. An empty socket path in $TMUX (",0,0") makes

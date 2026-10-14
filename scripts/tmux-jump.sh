@@ -30,7 +30,15 @@ fi
 
 # A FIFO, not a regular file: the reader blocks in IO.select and wakes the
 # instant tmux writes, so there is no polling interval on the keypress path.
-prompt_file="$(mktemp -u "${TMPDIR:-/tmp}/tmux-jump.XXXXXX")" || exit 1
+#
+# The path ends up inside the prompt template below, where ' # and % change its
+# meaning (see prompt_fifo_dir in tmux-jump.rb, which applies the same rule). A
+# TMPDIR holding any of them, or a control character, is swapped for /tmp.
+fifo_dir="${TMPDIR:-/tmp}"
+case "$fifo_dir" in
+  *"'"* | *'#'* | *'%'* | *[[:cntrl:]]*) fifo_dir=/tmp ;;
+esac
+prompt_file="$(mktemp -u "$fifo_dir/tmux-jump.XXXXXX")" || exit 1
 mkfifo "$prompt_file" || exit 1
 
 # Separate channel so "the prompt chain finished" can never be confused with a

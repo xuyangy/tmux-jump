@@ -339,11 +339,26 @@ end
 
 # A FIFO at a plain $TMPDIR path. Tempfile would do this too, but requiring it
 # costs 17ms of interpreter startup -- see the performance contract at the top.
+#
+# The FIFO path is written into prompt_template, where three characters change
+# its meaning: ' ends the single-quoted word, save-buffer format-expands #
+# sequences, and command-prompt substitutes % sequences across the whole
+# template. A control character has no business in it either. A TMPDIR holding
+# any of them is swapped for /tmp before anything is created there. The same
+# rule guards the launcher's FIFO in tmux-jump.sh; keep the two in step.
+UNSAFE_FIFO_PATH = /['#%[:cntrl:]]/
+
+def prompt_fifo_dir(tmpdir = ENV['TMPDIR'])
+  return '/tmp' if tmpdir.nil? || tmpdir.empty? || tmpdir.match?(UNSAFE_FIFO_PATH)
+
+  tmpdir
+end
+
 def prompt_fifo_path!
   path = Config.prompt_file
   return path if path && !path.empty?
 
-  dir = ENV['TMPDIR'] || '/tmp'
+  dir = prompt_fifo_dir
   path = File.join(dir, "tmux-jump-#{Process.pid}.fifo")
   File.delete(path) if File.exist?(path)
   File.mkfifo path
